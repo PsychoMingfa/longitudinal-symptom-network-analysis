@@ -1,0 +1,475 @@
+################################################################################
+## Fixed Participant Cohort Network Replication Analysis
+##
+## Workflow:
+##   1. Read 5-wave longitudinal datasets.
+##   2. Reconstruct optimal full-sample sparse Ising networks for Depression and Anxiety.
+##   3. Extract empirical network topologies (omega patterns).
+##   4. Identify and extract strict complete-case fixed cohort participants (N = 3,155).
+##   5. Fit constrained Ising models to estimate relative temperatures (T = 1/beta) and entropy.
+##   6. Perform participant-level ID bootstrap for 95% CIs and trajectory contrasts.
+##   7. Diagnose qualitative trajectory replication patterns.
+################################################################################
+
+# ==============================================================================
+# 0. CONFIGURATION AND SETTINGS
+# ==============================================================================
+possible_dirs <- c(
+  "Full sample data",
+  file.path(getwd(), "Full sample data"),
+  ".",
+  "data"
+)
+data_dir <- possible_dirs[dir.exists(possible_dirs) & file.exists(file.path(possible_dirs, "wave1.xlsx"))][1]
+if (is.na(data_dir)) data_dir <- "Full sample data"
+
+wave_files <- c("wave1.xlsx", "wave2.xlsx", "wave3.xlsx", "wave4.xlsx", "wave5.xlsx")
+output_dir <- file.path(".", "fixed_cohort_replication")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+REBUILD_FULL_MODELS <- TRUE     # Set to TRUE on first run; can be FALSE once RDS models exist
+BOOT_R <- 1000                  # Number of bootstrap replicates (use 20 for testing, 1000 for final)
+BOOT_CORES <- min(4L, max(1L, parallel::detectCores() - 1L))
+BOOT_BATCH_SIZE <- 50
+SEED_DEP <- 20260716
+SEED_ANX <- 20260717
+
+# ==============================================================================
+# 1. REQUIRED LIBRARIES
+# ==============================================================================
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(readr)
+  library(psychonetrics)
+  library(IsingSampler)
+  library(parallel)
+})
+
+# ==============================================================================
+# 2. ITEM DEFINITIONS
+# ==============================================================================
+dep_items <- paste0("Q", c(5, 14, 15, 20, 22, 26, 29, 30, 31, 32, 54, 71, 79))
+anx_items <- paste0("Q", c(2, 17, 23, 33, 39, 57, 72, 78, 80, 86))
+all_items <- unique(c(dep_items, anx_items))
+
+# ==============================================================================
+# 3. HELPER FUNCTIONS
+# ==============================================================================
+to_num <- function(x) suppressWarnings(as.numeric(as.character(x)))
+
+make_binary <- function(dat, items) {
+  dat %>% 
+    select(ID, time, all_of(items)) %>%
+    mutate(across(all_of(items), ~ case_when(
+      is.na(.x)  ~ NA_integer_,
+      .x == 0    ~ -1L,
+      .x >= 1    ~ 1L,
+      TRUE       ~ NA_integer_
+    )))
+}
+
+extract_temperature <- function(model) {
+  b <- getmatrix(model, "beta")
+  b <- vapply(b, function(x) mean(as.numeric(x), na.rm = TRUE), numeric(1))
+  out <- 1 / b
+  names(out) <- paste0("T", seq_along(out))
+  out
+}
+
+fit_full_best <- function(long_bin, items, domain) {
+  d <- long_bin %>% 
+    select(time, all_of(items)) %>%
+    drop_na(all_of(items)) %>% 
+    mutate(time = as.integer(time))
+  
+  cat("\n[", domain, "] Full sample observations per wave:\n", sep = "")
+  print(count(d, time))
+  
+  m1 <- Ising(d, vars = items, groups = "time", missing = "listwise", storedata = TRUE) %>% runmodel()
+  m2 <- m1 %>% groupequal("omega") %>% runmodel()
+  m3 <- m2 %>% groupequal("tau") %>% runmodel()
+  m3 %>% prune(alpha = 0.05) %>% stepup(mi = "mi_equal", alpha = 0.05)
+}
+
+extract_pattern <- function(model, items, tol = 1e-8) {
+  om <- getmatrix(model, "omega")
+  if (is.list(om)) om <- om[[1]]
+  om <- as.matrix(om)
+  if (is.null(rownames(om))) rownames(om) <- items
+  if (is.null(colnames(om))) colnames(om) <- items
+  om <- om[items, items, drop = FALSE]
+  p <- 1L * (abs(om) > tol)
+  diag(p) <- 0L
+  p <- 1L * ((p + t(p)) > 0)
+  diag(p) <- 0L
+  dimnames(p) <- list(items, items)
+  p
+}
+
+edge_n <- function(p) sum(p[upper.tri(p)] != 0)
+
+make_fixed <- function(long_raw, common_ids, items, domain) {
+  d <- long_raw %>% 
+    filter(ID %in% common_ids) %>%
+    select(ID, time, all_of(items)) %>% 
+    arrange(ID, time)
+  
+  d$row_complete <- complete.cases(d[, items, drop = FALSE])
+  st <- d %>% 
+    group_by(ID) %>% 
+    summarise(
+      n_records = n(),
+      n_waves = n_distinct(time),
+      all_complete = all(row_complete),
+      .groups = "drop"
+    )
+  
+  ids <- st %>% filter(n_records == 5, n_waves == 5, all_complete) %>% pull(ID)
+  out <- d %>% 
+    filter(ID %in% ids) %>% 
+    select(-row_complete) %>%
+    mutate(
+      time = as.integer(time),
+      across(all_of(items), ~ ifelse(.x >= 1, 1L, -1L))
+    ) %>% 
+    arrange(ID, time)
+  
+  wn <- count(out, time, name = "N")
+  cat("\n[", domain, "] Strict complete-case fixed cohort size: N = ", length(ids), "\n", sep = "")
+  print(wn)
+  if (nrow(wn) != 5 || length(unique(wn$N)) != 1) stop(domain, ": Inconsistent sample sizes across waves.")
+  list(ids = ids, data = out, status = st, wave_n = wn)
+}
+
+fit_fixed_pattern <- function(fixed_long, items, pattern, domain) {
+  d <- fixed_long %>%
+    transmute(
+      time = as.integer(time),
+      across(all_of(items), as.integer)
+    ) %>%
+    drop_na(all_of(items)) %>%
+    arrange(time)
+  
+  bad <- vapply(d[items], function(x) any(!(x %in% c(-1L, 1L))), logical(1))
+  if (any(bad)) {
+    stop(domain, ": Invalid values found outside {-1, 1}: ", paste(names(bad)[bad], collapse = ", "))
+  }
+  
+  cat("\nFitting [", domain, "] fixed cohort model; free edges = ", edge_n(pattern), "\n", sep = "")
+  Ising(
+    data      = d,
+    vars      = items,
+    groups    = "time",
+    omega     = pattern,
+    equal     = c("omega", "tau"),
+    missing   = "listwise",
+    storedata = TRUE,
+    identify  = TRUE
+  ) %>% runmodel()
+}
+
+extract_temp_entropy <- function(model, domain) {
+  b  <- getmatrix(model, "beta")
+  om <- getmatrix(model, "omega")
+  ta <- getmatrix(model, "tau")
+  b  <- vapply(b, function(x) mean(as.numeric(x), na.rm = TRUE), numeric(1))
+  T_val <- 1 / b
+  efun  <- if ("IsingEntropy" %in% ls("package:IsingSampler")) IsingSampler::IsingEntropy else IsingSampler::IsingEntrophy
+  H <- numeric(length(om))
+  for (i in seq_along(om)) {
+    g <- as.matrix(om[[i]])
+    g <- (g + t(g)) / 2
+    H[i] <- efun(graph = g, thresholds = as.numeric(ta[[i]]), beta = b[i])
+  }
+  tibble(Domain = domain, Wave = paste0("T", seq_along(b)), Beta = b, Temperature = T_val, Entropy = H)
+}
+
+make_wide <- function(fixed_long, items) {
+  fixed_long %>% 
+    select(ID, time, all_of(items)) %>% 
+    pivot_wider(
+      id_cols     = ID,
+      names_from  = time,
+      values_from = all_of(items),
+      names_glue  = "{.value}.{time}"
+    )
+}
+
+run_boot <- function(fixed_long, items, pattern, domain, output_dir, R = 1000, ncores = 2, seed = 1, batch_size = 50) {
+  boot_wide_global  <- make_wide(fixed_long, items)
+  boot_items_global <- items
+  boot_pattern_global <- pattern
+  boot_n_global     <- nrow(boot_wide_global)
+  boot_seed_global  <- seed
+  res <- matrix(NA_real_, R, 4, dimnames = list(NULL, paste0("T", 2:5)))
+  
+  worker <- function(i) {
+    set.seed(boot_seed_global + i)
+    idx <- sample.int(boot_n_global, boot_n_global, replace = TRUE)
+    bd  <- boot_wide_global[idx, , drop = FALSE]
+    bd$BootID <- seq_len(nrow(bd))
+    bd$ID <- NULL
+    bl <- tidyr::pivot_longer(
+      bd, 
+      cols = -BootID,
+      names_to = c(".value", "time"),
+      names_pattern = "(Q\\d+)\\.(\\d+)"
+    )
+    bl$time <- as.integer(bl$time)
+    md <- bl[, c("time", boot_items_global), drop = FALSE]
+    
+    tryCatch({
+      m <- psychonetrics::Ising(
+        data      = md,
+        vars      = boot_items_global,
+        groups    = "time",
+        omega     = boot_pattern_global,
+        equal     = c("omega", "tau"),
+        missing   = "listwise",
+        storedata = TRUE,
+        identify  = TRUE
+      ) %>% psychonetrics::runmodel()
+      
+      b <- psychonetrics::getmatrix(m, "beta")
+      b <- vapply(b, function(x) mean(as.numeric(x), na.rm = TRUE), numeric(1))
+      (1 / b)[-1]
+    }, error = function(e) rep(NA_real_, 4))
+  }
+  
+  cl <- makeCluster(ncores)
+  on.exit(stopCluster(cl), add = TRUE)
+  clusterEvalQ(cl, { library(psychonetrics); library(tidyr) })
+  clusterExport(cl, c("boot_wide_global", "boot_items_global", "boot_pattern_global",
+                      "boot_n_global", "boot_seed_global"), envir = environment())
+  
+  nb <- ceiling(R / batch_size)
+  for (b in seq_len(nb)) {
+    idx <- ((b - 1) * batch_size + 1):min(b * batch_size, R)
+    out <- parLapply(cl, idx, worker)
+    res[idx, ] <- do.call(rbind, out)
+    saveRDS(list(t = res[1:max(idx), , drop = FALSE], R = max(idx)),
+            file.path(output_dir, paste0("Fixed_", domain, "_bootstrap_partial.rds")))
+  }
+  
+  out <- list(t = res, R = R)
+  saveRDS(out, file.path(output_dir, paste0("Fixed_", domain, "_bootstrap_final.rds")))
+  succ <- sum(complete.cases(res))
+  cat(domain, ": ", succ, "/", R, " successful bootstrap replicates.\n", sep = "")
+  out
+}
+
+summarize_boot <- function(point, boot) {
+  bm <- as.matrix(boot$t)
+  ci <- t(vapply(seq_len(ncol(bm)), function(j) {
+    x <- bm[is.finite(bm[, j]), j]
+    if (length(x) < 20) c(NA_real_, NA_real_) else quantile(x, c(0.025, 0.975), names = FALSE, type = 7)
+  }, numeric(2)))
+  
+  tab <- tibble(
+    Wave = paste0("T", 2:5),
+    Bootstrap_CI_lower = ci[, 1],
+    Bootstrap_CI_upper = ci[, 2],
+    Successful_bootstrap = vapply(seq_len(ncol(bm)), function(j) sum(is.finite(bm[, j])), integer(1))
+  )
+  left_join(point, tab, by = "Wave")
+}
+
+emp_p <- function(x) {
+  x <- x[is.finite(x)]
+  n <- length(x)
+  if (n < 20) return(NA_real_)
+  min(1, 2 * min((sum(x <= 0) + 1) / (n + 1), (sum(x >= 0) + 1) / (n + 1)))
+}
+
+contrast_test <- function(point, boot, domain) {
+  pt <- setNames(point$Temperature, point$Wave)
+  bm <- as.matrix(boot$t)
+  bt <- cbind(T1 = 1, T2 = bm[, 1], T3 = bm[, 2], T4 = bm[, 3], T5 = bm[, 4])
+  nm <- c("T2-T1", "T3-T1", "T5-T3", "T5-T1")
+  pe <- setNames(c(pt[["T2"]] - pt[["T1"]], pt[["T3"]] - pt[["T1"]],
+                   pt[["T5"]] - pt[["T3"]], pt[["T5"]] - pt[["T1"]]), nm)
+  bd <- cbind(`T2-T1` = bt[, "T2"] - bt[, "T1"], `T3-T1` = bt[, "T3"] - bt[, "T1"],
+              `T5-T3` = bt[, "T5"] - bt[, "T3"], `T5-T1` = bt[, "T5"] - bt[, "T1"])
+  
+  ci <- t(vapply(nm, function(z) {
+    x <- bd[is.finite(bd[, z]), z]
+    if (length(x) < 20) c(NA, NA) else quantile(x, c(0.025, 0.975), names = FALSE, type = 7)
+  }, numeric(2)))
+  
+  rp <- setNames(vapply(nm, function(z) emp_p(bd[, z]), numeric(1)), nm)
+  tibble(
+    Domain          = domain,
+    Contrast        = nm,
+    Estimate        = unname(pe[nm]),
+    CI_lower        = ci[, 1],
+    CI_upper        = ci[, 2],
+    Raw_bootstrap_p = unname(rp[nm]),
+    Holm_p          = unname(p.adjust(rp, method = "holm")[nm])
+  )
+}
+
+diagnose_shape <- function(point) {
+  tt <- setNames(point$Temperature, point$Wave)
+  early <- tt[c("T2", "T3")]
+  peak  <- max(early)
+  pw    <- names(which.max(early))
+  tibble(
+    Domain                   = unique(point$Domain),
+    Early_peak_wave          = pw,
+    Early_peak_temperature   = peak,
+    T5_temperature           = tt[["T5"]],
+    T5_minus_peak            = tt[["T5"]] - peak,
+    T5_minus_T1              = tt[["T5"]] - tt[["T1"]],
+    Same_qualitative_pattern = (peak > tt[["T1"]] && tt[["T5"]] < peak && tt[["T5"]] > tt[["T1"]])
+  )
+}
+
+# ==============================================================================
+# 4. LOAD AND VALIDATE RAW DATA
+# ==============================================================================
+paths <- file.path(data_dir, wave_files)
+if (!all(file.exists(paths))) {
+  stop("Missing wave data files:\n", paste(paths[!file.exists(paths)], collapse = "\n"))
+}
+
+wave_list <- lapply(paths, read_excel)
+names(wave_list) <- paste0("T", 1:5)
+wave_list <- map2(wave_list, 1:5, function(df, i) {
+  if (!"ID" %in% names(df)) stop("T", i, " is missing column ID.")
+  miss <- setdiff(all_items, names(df))
+  if (length(miss)) stop("T", i, " missing items: ", paste(miss, collapse = ", "))
+  df %>% 
+    mutate(
+      ID   = trimws(as.character(ID)),
+      time = as.integer(i),
+      across(all_of(all_items), to_num)
+    ) %>% 
+    filter(!is.na(ID), ID != "")
+})
+
+# Check for within-wave duplicated IDs
+dup <- map2_dfr(wave_list, names(wave_list), function(df, w) {
+  count(df, ID, name = "n") %>% filter(n > 1) %>% mutate(Wave = w)
+})
+if (nrow(dup)) {
+  write.csv(dup, file.path(output_dir, "duplicate_IDs_within_wave.csv"), row.names = FALSE)
+  stop("Duplicate IDs found within waves.")
+}
+
+long_raw <- bind_rows(wave_list)
+cat("\nTotal observations across 5 waves:\n")
+print(count(long_raw, time))
+
+# ==============================================================================
+# 5. RECONSTRUCT FULL-SAMPLE MODELS & EXTRACT TOPOLOGIES
+# ==============================================================================
+dep_path <- file.path(output_dir, "best_model_DEP_sparse_eqOmega_tau.rds")
+anx_path <- file.path(output_dir, "best_model_ANX_sparse_eqOmega_tau.rds")
+
+if (REBUILD_FULL_MODELS || !file.exists(dep_path) || !file.exists(anx_path)) {
+  message("Fitting full-sample optimal models to extract empirical network topologies...")
+  dep_bin <- make_binary(long_raw, dep_items)
+  anx_bin <- make_binary(long_raw, anx_items)
+  
+  full_dep <- fit_full_best(dep_bin, dep_items, "Depression")
+  full_anx <- fit_full_best(anx_bin, anx_items, "Anxiety")
+  
+  saveRDS(full_dep, dep_path)
+  saveRDS(full_anx, anx_path)
+} else {
+  message("Loading precomputed full-sample models...")
+  full_dep <- readRDS(dep_path)
+  full_anx <- readRDS(anx_path)
+}
+
+cat("\nFull-sample Depression relative temperature:\n")
+print(extract_temperature(full_dep))
+cat("\nFull-sample Anxiety relative temperature:\n")
+print(extract_temperature(full_anx))
+
+dep_pattern <- extract_pattern(full_dep, dep_items)
+anx_pattern <- extract_pattern(full_anx, anx_items)
+saveRDS(dep_pattern, file.path(output_dir, "DEP_selected_omega_pattern.rds"))
+saveRDS(anx_pattern, file.path(output_dir, "ANX_selected_omega_pattern.rds"))
+
+cat("Depression free edges: ", edge_n(dep_pattern), "\n")
+cat("Anxiety free edges:    ", edge_n(anx_pattern), "\n")
+
+# ==============================================================================
+# 6. EXTRACT FIXED PARTICIPANT COHORT & FIT MODELS
+# ==============================================================================
+common_ids <- Reduce(intersect, lapply(wave_list, function(df) unique(df$ID)))
+cat("Participants with records across all 5 waves: N = ", length(common_ids), "\n")
+
+dep_fixed <- make_fixed(long_raw, common_ids, dep_items, "Depression")
+anx_fixed <- make_fixed(long_raw, common_ids, anx_items, "Anxiety")
+
+write.csv(
+  tibble(Domain = c("Depression", "Anxiety"), Fixed_cohort_N = c(length(dep_fixed$ids), length(anx_fixed$ids))),
+  file.path(output_dir, "Fixed_cohort_sample_sizes.csv"),
+  row.names = FALSE
+)
+
+fixed_model_dep <- fit_fixed_pattern(dep_fixed$data, dep_items, dep_pattern, "Depression")
+saveRDS(fixed_model_dep, file.path(output_dir, "Fixed_cohort_DEP_model.rds"))
+fixed_model_anx <- fit_fixed_pattern(anx_fixed$data, anx_items, anx_pattern, "Anxiety")
+saveRDS(fixed_model_anx, file.path(output_dir, "Fixed_cohort_ANX_model.rds"))
+
+pt_dep <- extract_temp_entropy(fixed_model_dep, "Depression")
+pt_anx <- extract_temp_entropy(fixed_model_anx, "Anxiety")
+pt_all <- bind_rows(pt_dep, pt_anx)
+write.csv(pt_all, file.path(output_dir, "Fixed_cohort_temperature_entropy_point_estimates.csv"), row.names = FALSE)
+
+cat("\nFixed cohort temperature and entropy estimates:\n")
+print(pt_all)
+
+# ==============================================================================
+# 7. PARTICIPANT-LEVEL ID BOOTSTRAP INFERENCE
+# ==============================================================================
+boot_dep <- run_boot(dep_fixed$data, dep_items, dep_pattern, "Depression", output_dir,
+                     R = BOOT_R, ncores = BOOT_CORES, seed = SEED_DEP, batch_size = BOOT_BATCH_SIZE)
+boot_anx <- run_boot(anx_fixed$data, anx_items, anx_pattern, "Anxiety", output_dir,
+                     R = BOOT_R, ncores = BOOT_CORES, seed = SEED_ANX, batch_size = BOOT_BATCH_SIZE)
+
+ci_dep <- summarize_boot(pt_dep, boot_dep)
+ci_anx <- summarize_boot(pt_anx, boot_anx)
+ci_all <- bind_rows(ci_dep, ci_anx)
+write.csv(ci_all, file.path(output_dir, "Fixed_cohort_temperature_entropy_bootstrap_CI.csv"), row.names = FALSE)
+
+ct_dep <- contrast_test(pt_dep, boot_dep, "Depression")
+ct_anx <- contrast_test(pt_anx, boot_anx, "Anxiety")
+ct_all <- bind_rows(ct_dep, ct_anx)
+write.csv(ct_all, file.path(output_dir, "Fixed_cohort_temperature_contrasts.csv"), row.names = FALSE)
+
+# ==============================================================================
+# 8. TRAJECTORY PATTERN DIAGNOSIS & REPORT GENERATION
+# ==============================================================================
+diag_all <- bind_rows(diagnose_shape(pt_dep), diagnose_shape(pt_anx))
+write.csv(diag_all, file.path(output_dir, "Fixed_cohort_curve_shape_diagnosis.csv"), row.names = FALSE)
+
+cat("\nFixed cohort curve shape diagnosis:\n")
+print(diag_all)
+
+conclusion_text <- if (all(diag_all$Same_qualitative_pattern)) {
+  "Overall longitudinal pattern replicated in the strict fixed cohort."
+} else {
+  "Overall longitudinal pattern did not replicate in the strict fixed cohort."
+}
+cat("\nConclusion: ", conclusion_text, "\n")
+
+result_text <- paste0(
+  "Depression T1-T5 temperature = ", paste(sprintf("%.3f", pt_dep$Temperature), collapse = ", "),
+  "; T2-T5 bootstrap 95% CI = ", paste(sprintf("%.3f-%.3f", ci_dep$Bootstrap_CI_lower[-1], ci_dep$Bootstrap_CI_upper[-1]), collapse = ", "),
+  "; Network entropy = ", paste(sprintf("%.5f", pt_dep$Entropy), collapse = ", "), ".\n",
+  "Anxiety T1-T5 temperature = ", paste(sprintf("%.3f", pt_anx$Temperature), collapse = ", "),
+  "; T2-T5 bootstrap 95% CI = ", paste(sprintf("%.3f-%.3f", ci_anx$Bootstrap_CI_lower[-1], ci_anx$Bootstrap_CI_upper[-1]), collapse = ", "),
+  "; Network entropy = ", paste(sprintf("%.5f", pt_anx$Entropy), collapse = ", "), ".\n",
+  conclusion_text, "\n"
+)
+writeLines(result_text, file.path(output_dir, "Fixed_cohort_result_text.txt"))
+
+message("Fixed cohort replication completed successfully. Output saved to: ", output_dir)
