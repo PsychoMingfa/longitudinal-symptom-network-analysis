@@ -1,0 +1,466 @@
+################################################################################
+## Symptom-Burden Trajectories by Sleep Complaint Group (Linear Mixed Models)
+##
+## Model Specification:
+##   symptom_mean ~ Wave * SleepGroup + BaselineAge + Sex + (1 | ID)
+##
+## Methodology:
+##   - Original SCL-90 item scores (0-4) are averaged for Depression and Anxiety.
+##   - Wave is modeled as a categorical factor (T1-T5).
+##   - Sleep complaint groups, baseline age, and sex are defined at baseline (T1).
+##   - All available repeated observations are included using random-intercept models.
+##   - REML estimation with Satterthwaite degrees of freedom and Type III F-tests.
+##   - Estimated Marginal Means (EMMs) and planned contrast tests using emmeans.
+##   - Automated generation of publication-ready summary text and tables for Results 3.7.
+################################################################################
+
+# ==============================================================================
+# 0. CONFIGURATION AND SETTINGS
+# ==============================================================================
+possible_dirs <- c(
+  "Full sample data",
+  file.path(getwd(), "Full sample data"),
+  "3155 sample data",
+  file.path(getwd(), "3155 sample data"),
+  ".",
+  "data"
+)
+data_dir <- possible_dirs[dir.exists(possible_dirs)][1]
+if (is.na(data_dir)) data_dir <- "Full sample data"
+
+if (all(file.exists(file.path(data_dir, c("wave1.xlsx", "wave2.xlsx", "wave3.xlsx", "wave4.xlsx", "wave5.xlsx"))))) {
+  wave_files <- c("wave1.xlsx", "wave2.xlsx", "wave3.xlsx", "wave4.xlsx", "wave5.xlsx")
+} else if (all(file.exists(file.path(data_dir, paste0("fixed_cohort_3155_T", 1:5, ".xlsx"))))) {
+  wave_files <- paste0("fixed_cohort_3155_T", 1:5, ".xlsx")
+} else {
+  wave_files <- c("wave1.xlsx", "wave2.xlsx", "wave3.xlsx", "wave4.xlsx", "wave5.xlsx")
+}
+
+output_dir <- file.path(".", "symptom_burden_LMM")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Variable names (NULL triggers automatic case-insensitive detection)
+AGE_VAR <- NULL
+SEX_VAR <- NULL
+
+# Minimum proportion of items required to compute subscale mean
+MIN_ITEM_PROP <- 1.00
+
+# Handling of values outside the declared 0-4 range: "report_and_na" or "stop"
+OUT_OF_RANGE_ACTION <- "report_and_na"
+
+# emmeans options
+CONTRAST_ADJUST <- "none"
+EMM_WEIGHTS <- "proportional"
+EMM_LMERTEST_LIMIT <- 50000
+
+# ==============================================================================
+# 1. REQUIRED LIBRARIES
+# ==============================================================================
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(readr)
+  library(lme4)
+  library(lmerTest)
+  library(emmeans)
+})
+
+# ==============================================================================
+# 2. ITEM DEFINITIONS AND FACTOR LEVELS
+# ==============================================================================
+dep_items <- paste0("Q", c(5, 14, 15, 20, 22, 26, 29, 30, 31, 32, 54, 71, 79))
+anx_items <- paste0("Q", c(2, 17, 23, 33, 39, 57, 72, 78, 80, 86))
+sleep_items <- c("Q44", "Q64", "Q66")
+
+wave_levels <- paste0("T", 1:5)
+sleep_group_levels <- c("No complaint", "Single complaint", "Multiple complaints")
+
+# ==============================================================================
+# 3. HELPER FUNCTIONS
+# ==============================================================================
+to_numeric_safe <- function(x) {
+  suppressWarnings(readr::parse_number(as.character(x), na = c("", "NA", "N/A", "missing")))
+}
+
+pick_variable <- function(data_names, manual_name, candidates, label) {
+  if (!is.null(manual_name)) {
+    if (!(manual_name %in% data_names)) stop(label, " variable '", manual_name, "' not found.")
+    return(manual_name)
+  }
+  lower_names <- tolower(trimws(data_names))
+  lower_candidates <- tolower(trimws(candidates))
+  matched <- match(lower_candidates, lower_names, nomatch = 0)
+  matched <- matched[matched > 0]
+  if (length(matched) > 0) return(data_names[matched[1]])
+  stop("Unable to automatically detect ", label, " variable. Candidate variables:\n", paste(data_names, collapse = ", "))
+}
+
+clean_item_scores <- function(data, items, wave_name, action = c("report_and_na", "stop")) {
+  action <- match.arg(action)
+  invalid_rows <- list()
+  
+  for (item_name in items) {
+    raw_values <- data[[item_name]]
+    numeric_values <- to_numeric_safe(raw_values)
+    bad_index <- which(!is.na(numeric_values) & !(numeric_values %in% 0:4))
+    if (length(bad_index) > 0) {
+      invalid_rows[[length(invalid_rows) + 1]] <- tibble(
+        Wave        = wave_name,
+        RowIndex    = bad_index,
+        ID          = if ("ID" %in% names(data)) data$ID[bad_index] else NA_character_,
+        Item        = item_name,
+        RawValue    = as.character(raw_values[bad_index]),
+        ParsedValue = numeric_values[bad_index]
+      )
+    }
+    data[[item_name]] <- numeric_values
+  }
+  
+  if (length(invalid_rows) > 0) {
+    invalid_table <- bind_rows(invalid_rows)
+    write.csv(invalid_table, file.path(output_dir, paste0("out_of_range_values_", wave_name, ".csv")), row.names = FALSE)
+    if (action == "stop") stop(wave_name, ": Out-of-range values detected.")
+    for (item_name in unique(invalid_table$Item)) {
+      v <- data[[item_name]]
+      v[!is.na(v) & !(v %in% 0:4)] <- NA_real_
+      data[[item_name]] <- v
+    }
+  }
+  data
+}
+
+score_subscale <- function(data, items, min_prop = 1.00) {
+  item_matrix <- as.matrix(data[, items, drop = FALSE])
+  storage.mode(item_matrix) <- "numeric"
+  valid_n <- rowSums(!is.na(item_matrix))
+  minimum_n <- ceiling(length(items) * min_prop)
+  score <- rowMeans(item_matrix, na.rm = TRUE)
+  score[valid_n < minimum_n] <- NA_real_
+  score[!is.finite(score)] <- NA_real_
+  score
+}
+
+format_p <- function(p_value) {
+  if (length(p_value) == 0 || is.na(p_value)) return("NA")
+  if (p_value < 0.001) return("<0.001")
+  paste0("=", sprintf("%.3f", p_value))
+}
+
+format_mean_ci <- function(estimate, lower, upper) {
+  paste0(sprintf("%.3f", estimate), " (", sprintf("%.3f", lower), "-", sprintf("%.3f", upper), ")")
+}
+
+standardize_emmeans_columns <- function(result_data) {
+  result_data <- as.data.frame(result_data)
+  if (!("lower.CL" %in% names(result_data)) && ("asymp.LCL" %in% names(result_data))) {
+    names(result_data)[names(result_data) == "asymp.LCL"] <- "lower.CL"
+  }
+  if (!("upper.CL" %in% names(result_data)) && ("asymp.UCL" %in% names(result_data))) {
+    names(result_data)[names(result_data) == "asymp.UCL"] <- "upper.CL"
+  }
+  if (!("t.ratio" %in% names(result_data)) && ("z.ratio" %in% names(result_data))) {
+    names(result_data)[names(result_data) == "z.ratio"] <- "t.ratio"
+  }
+  if (!("df" %in% names(result_data))) result_data$df <- Inf
+  result_data
+}
+
+get_type3_row <- function(anova_table, effect_name) {
+  output <- as.data.frame(anova_table)
+  output$Effect <- rownames(output)
+  rownames(output) <- NULL
+  matched <- output[output$Effect == effect_name, , drop = FALSE]
+  if (nrow(matched) != 1) stop("Unable to isolate Type III effect: ", effect_name)
+  matched
+}
+
+get_F_values <- function(F_row) {
+  num_col <- grep("NumDF", names(F_row), value = TRUE)[1]
+  den_col <- grep("DenDF", names(F_row), value = TRUE)[1]
+  f_col   <- grep("^F value$", names(F_row), value = TRUE)[1]
+  p_col   <- grep("Pr\\(>F\\)", names(F_row), value = TRUE)[1]
+  list(
+    numerator_df   = F_row[, num_col, drop = TRUE],
+    denominator_df = F_row[, den_col, drop = TRUE],
+    F_value        = F_row[, f_col, drop = TRUE],
+    p_value        = F_row[, p_col, drop = TRUE]
+  )
+}
+
+# ==============================================================================
+# 4. MIXED-EFFECTS MODEL ESTIMATION FUNCTION
+# ==============================================================================
+fit_burden_model <- function(data, outcome_name, domain_name) {
+  required_cols <- c(outcome_name, "BaselineAge", "Sex", "SleepGroup", "Wave", "ID")
+  complete_idx  <- complete.cases(data[, required_cols, drop = FALSE])
+  model_data    <- droplevels(data[complete_idx, , drop = FALSE])
+  
+  model_data$ID         <- factor(model_data$ID)
+  model_data$Wave       <- factor(model_data$Wave, levels = wave_levels)
+  model_data$SleepGroup <- factor(model_data$SleepGroup, levels = sleep_group_levels)
+  model_data$Sex        <- factor(model_data$Sex)
+  
+  cat("\n============================================================\n")
+  cat(domain_name, "observations: N =", nrow(model_data), "\n")
+  cat(domain_name, "unique participants: N =", n_distinct(model_data$ID), "\n")
+  
+  model_formula <- as.formula(paste0(outcome_name, " ~ Wave * SleepGroup + BaselineAge + Sex + (1 | ID)"))
+  model_reml <- lmerTest::lmer(model_formula, data = model_data, REML = TRUE)
+  
+  type3_table <- anova(model_reml, type = 3, ddf = "Satterthwaite")
+  interaction_F <- get_type3_row(type3_table, "Wave:SleepGroup")
+  
+  adjusted_grid <- emmeans::emmeans(
+    model_reml,
+    specs          = ~ SleepGroup * Wave,
+    weights        = EMM_WEIGHTS,
+    lmer.df        = "satterthwaite",
+    lmerTest.limit = EMM_LMERTEST_LIMIT
+  )
+  
+  adjusted_means <- standardize_emmeans_columns(summary(adjusted_grid, infer = c(TRUE, FALSE), level = 0.95))
+  adjusted_means$Domain <- domain_name
+  adjusted_means$SleepGroup <- factor(adjusted_means$SleepGroup, levels = sleep_group_levels)
+  adjusted_means$Wave <- factor(adjusted_means$Wave, levels = wave_levels)
+  adjusted_means$Cell <- mapply(format_mean_ci, adjusted_means$emmean, adjusted_means$lower.CL, adjusted_means$upper.CL, USE.NAMES = FALSE)
+  
+  adjusted_means <- adjusted_means %>%
+    select(Domain, SleepGroup, Wave, emmean, SE, df, lower.CL, upper.CL, Cell)
+  
+  # Planned contrasts: within-group changes across waves
+  wave_within_group <- emmeans::emmeans(
+    model_reml,
+    specs          = ~ Wave | SleepGroup,
+    weights        = EMM_WEIGHTS,
+    lmer.df        = "satterthwaite",
+    lmerTest.limit = EMM_LMERTEST_LIMIT
+  )
+  
+  within_contrasts <- standardize_emmeans_columns(
+    summary(
+      contrast(wave_within_group, method = "trt.vs.ctrl", ref = 1, adjust = CONTRAST_ADJUST),
+      infer = c(TRUE, TRUE),
+      level = 0.95
+    )
+  )
+  within_contrasts$Domain <- domain_name
+  
+  # T5 group contrasts (vs. No complaint)
+  group_at_T5 <- emmeans::emmeans(
+    model_reml,
+    specs          = ~ SleepGroup | Wave,
+    weights        = EMM_WEIGHTS,
+    lmer.df        = "satterthwaite",
+    lmerTest.limit = EMM_LMERTEST_LIMIT
+  )
+  
+  T5_contrasts <- standardize_emmeans_columns(
+    summary(
+      contrast(group_at_T5, method = "trt.vs.ctrl", ref = 1, adjust = CONTRAST_ADJUST),
+      infer = c(TRUE, TRUE),
+      level = 0.95
+    )
+  ) %>% filter(Wave == "T5")
+  T5_contrasts$Domain <- domain_name
+  
+  variance_table <- as.data.frame(lme4::VarCorr(model_reml))
+  rand_sd <- variance_table$sdcor[variance_table$grp == "ID"]
+  
+  diagnostics <- tibble(
+    Domain              = domain_name,
+    Outcome             = outcome_name,
+    Observations        = nrow(model_data),
+    Participants        = n_distinct(model_data$ID),
+    Random_intercept_SD = rand_sd,
+    Residual_SD         = sigma(model_reml),
+    Singular            = lme4::isSingular(model_reml, tol = 1e-4)
+  )
+  
+  list(
+    model_data     = model_data,
+    model_reml     = model_reml,
+    type3_table    = type3_table,
+    interaction_F  = interaction_F,
+    adjusted_means = adjusted_means,
+    within_group   = within_contrasts,
+    T5_contrasts   = T5_contrasts,
+    diagnostics    = diagnostics
+  )
+}
+
+# ==============================================================================
+# 5. LOAD AND VALIDATE RAW DATA
+# ==============================================================================
+file_paths <- file.path(data_dir, wave_files)
+if (!all(file.exists(file_paths))) {
+  stop("Missing wave data files:\n", paste(file_paths[!file.exists(file_paths)], collapse = "\n"))
+}
+
+wave_list <- lapply(file_paths, readxl::read_excel)
+names(wave_list) <- wave_levels
+
+required_items <- unique(c(dep_items, anx_items, sleep_items))
+for (wave_index in seq_along(wave_list)) {
+  current_data <- wave_list[[wave_index]]
+  if (!"ID" %in% names(current_data)) stop("T", wave_index, " missing ID variable.")
+  missing_items <- setdiff(required_items, names(current_data))
+  if (length(missing_items) > 0) stop("T", wave_index, " missing items: ", paste(missing_items, collapse = ", "))
+  current_data$ID <- trimws(as.character(current_data$ID))
+  current_data <- clean_item_scores(current_data, required_items, wave_levels[wave_index], OUT_OF_RANGE_ACTION)
+  wave_list[[wave_index]] <- current_data
+}
+
+# ==============================================================================
+# 6. BASELINE SLEEP, COVARIATES, AND SCORE CALCULATION
+# ==============================================================================
+t1_data <- wave_list$T1
+age_variable <- pick_variable(names(t1_data), AGE_VAR, c("age", "baseline_age", "age_t1", "Age"), "Age")
+sex_variable <- pick_variable(names(t1_data), SEX_VAR, c("sex", "gender", "Sex", "Gender"), "Sex")
+
+cat("Detected Age variable:", age_variable, "\n")
+cat("Detected Sex variable:", sex_variable, "\n")
+
+t1_data$BaselineAge <- to_numeric_safe(t1_data[[age_variable]])
+t1_data$Sex         <- factor(trimws(as.character(t1_data[[sex_variable]])))
+
+t1_sleep_matrix  <- as.matrix(t1_data[, sleep_items, drop = FALSE])
+t1_sleep_missing <- rowSums(is.na(t1_sleep_matrix)) > 0
+t1_valid_data    <- t1_data[!t1_sleep_missing, , drop = FALSE]
+
+t1_positive_count <- rowSums(as.matrix(t1_valid_data[, sleep_items, drop = FALSE]) >= 1)
+t1_sleep_groups   <- case_when(
+  t1_positive_count == 0 ~ "No complaint",
+  t1_positive_count == 1 ~ "Single complaint",
+  t1_positive_count >= 2 ~ "Multiple complaints"
+)
+
+t1_subject_profile <- tibble(
+  ID          = t1_valid_data$ID,
+  SleepGroup  = factor(t1_sleep_groups, levels = sleep_group_levels),
+  BaselineAge = t1_valid_data$BaselineAge,
+  Sex         = t1_valid_data$Sex
+) %>% drop_na(SleepGroup, BaselineAge, Sex)
+
+cat("\nT1 Sleep Group Distribution:\n")
+print(count(t1_subject_profile, SleepGroup))
+
+# Construct repeated measures dataset
+long_records <- list()
+for (wave_index in seq_along(wave_list)) {
+  w_data <- wave_list[[wave_index]]
+  w_dep  <- score_subscale(w_data, dep_items, MIN_ITEM_PROP)
+  w_anx  <- score_subscale(w_data, anx_items, MIN_ITEM_PROP)
+  
+  df_scored <- tibble(
+    ID              = w_data$ID,
+    Wave            = wave_levels[wave_index],
+    DepressionScore = w_dep,
+    AnxietyScore    = w_anx
+  ) %>% inner_join(t1_subject_profile, by = "ID")
+  
+  long_records[[wave_index]] <- df_scored
+}
+full_analysis_data <- bind_rows(long_records)
+
+# ==============================================================================
+# 7. FIT LINEAR MIXED MODELS & EXTRACT ESTIMATES
+# ==============================================================================
+dep_results <- fit_burden_model(full_analysis_data, "DepressionScore", "Depression")
+anx_results <- fit_burden_model(full_analysis_data, "AnxietyScore", "Anxiety")
+
+saveRDS(dep_results$model_reml, file.path(output_dir, "Depression_LMM_REML.rds"))
+saveRDS(anx_results$model_reml, file.path(output_dir, "Anxiety_LMM_REML.rds"))
+
+all_type3 <- bind_rows(
+  as_tibble(dep_results$type3_table, rownames = "Effect") %>% mutate(Domain = "Depression"),
+  as_tibble(anx_results$type3_table, rownames = "Effect") %>% mutate(Domain = "Anxiety")
+)
+write.csv(all_type3, file.path(output_dir, "Symptom_burden_TypeIII_F_tests.csv"), row.names = FALSE)
+
+all_interaction_F <- bind_rows(
+  dep_results$interaction_F %>% mutate(Domain = "Depression"),
+  anx_results$interaction_F %>% mutate(Domain = "Anxiety")
+)
+write.csv(all_interaction_F, file.path(output_dir, "Symptom_burden_interaction_F_tests.csv"), row.names = FALSE)
+
+all_adjusted_means <- bind_rows(dep_results$adjusted_means, anx_results$adjusted_means)
+write.csv(all_adjusted_means, file.path(output_dir, "Symptom_burden_adjusted_means_long.csv"), row.names = FALSE)
+
+adjusted_table_wide <- all_adjusted_means %>%
+  select(Domain, SleepGroup, Wave, Cell) %>%
+  pivot_wider(names_from = Wave, values_from = Cell)
+write.csv(adjusted_table_wide, file.path(output_dir, "Symptom_burden_adjusted_means_table.csv"), row.names = FALSE)
+
+all_within <- bind_rows(dep_results$within_group, anx_results$within_group)
+write.csv(all_within, file.path(output_dir, "Symptom_burden_within_group_changes.csv"), row.names = FALSE)
+
+all_t5_contrasts <- bind_rows(dep_results$T5_contrasts, anx_results$T5_contrasts)
+write.csv(all_t5_contrasts, file.path(output_dir, "Symptom_burden_T5_group_contrasts.csv"), row.names = FALSE)
+
+all_diagnostics <- bind_rows(dep_results$diagnostics, anx_results$diagnostics)
+write.csv(all_diagnostics, file.path(output_dir, "Symptom_burden_model_diagnostics.csv"), row.names = FALSE)
+
+# ==============================================================================
+# 8. AUTOMATED REPORT GENERATION (RESULTS 3.7)
+# ==============================================================================
+format_f_report <- function(F_vals) {
+  paste0("F(", sprintf("%.1f", F_vals$numerator_df), ", ", sprintf("%.1f", F_vals$denominator_df), ")=",
+         sprintf("%.2f", F_vals$F_value), ", p", format_p(F_vals$p_value))
+}
+
+format_change_report <- function(row) {
+  sign_char <- ifelse(row$estimate >= 0, "+", "")
+  paste0(sign_char, sprintf("%.3f", row$estimate), " (95% CI ", sprintf("%.3f", row$lower.CL), " to ",
+         sprintf("%.3f", row$upper.CL), ", p", format_p(row$p.value), ")")
+}
+
+dep_f_vals <- get_F_values(dep_results$interaction_F)
+anx_f_vals <- get_F_values(anx_results$interaction_F)
+
+dep_means_vec <- split(dep_results$adjusted_means$emmean, dep_results$adjusted_means$SleepGroup)
+anx_means_vec <- split(anx_results$adjusted_means$emmean, anx_results$adjusted_means$SleepGroup)
+
+dep_t5_t1 <- dep_results$within_group %>% filter(contrast == "T5 - T1")
+anx_t5_t1 <- anx_results$within_group %>% filter(contrast == "T5 - T1")
+
+dep_t5_contrast <- dep_results$T5_contrasts %>% filter(contrast == "Multiple complaints - No complaint")
+anx_t5_contrast <- anx_results$T5_contrasts %>% filter(contrast == "Multiple complaints - No complaint")
+
+result_text_3_7 <- paste0(
+  "Results 3.7 Symptom-burden trajectories by sleep group:\n\n",
+  "Random-intercept linear mixed-effects models included ", nrow(dep_results$model_data),
+  " observations for depression and ", nrow(anx_results$model_data),
+  " observations for anxiety, adjusting for baseline age and sex.\n\n",
+  "For depression symptom burden, there was a significant Wave x SleepGroup interaction, ",
+  format_f_report(dep_f_vals), ". ",
+  "Estimated marginal means (T1-T5) were: ",
+  "No complaint = ", paste(sprintf("%.3f", dep_means_vec[["No complaint"]]), collapse = ", "), "; ",
+  "Single complaint = ", paste(sprintf("%.3f", dep_means_vec[["Single complaint"]]), collapse = ", "), "; ",
+  "Multiple complaints = ", paste(sprintf("%.3f", dep_means_vec[["Multiple complaints"]]), collapse = ", "), ". ",
+  "Within-group changes from T1 to T5: ",
+  "No complaint group, ", format_change_report(dep_t5_t1 %>% filter(SleepGroup == "No complaint")), "; ",
+  "Single complaint group, ", format_change_report(dep_t5_t1 %>% filter(SleepGroup == "Single complaint")), "; ",
+  "Multiple complaints group, ", format_change_report(dep_t5_t1 %>% filter(SleepGroup == "Multiple complaints")), ". ",
+  "At T5, participants with multiple complaints exhibited higher symptom burden than those with no complaints, difference = ",
+  format_change_report(dep_t5_contrast), ".\n\n",
+  "For anxiety symptom burden, there was also a significant Wave x SleepGroup interaction, ",
+  format_f_report(anx_f_vals), ". ",
+  "Estimated marginal means (T1-T5) were: ",
+  "No complaint = ", paste(sprintf("%.3f", anx_means_vec[["No complaint"]]), collapse = ", "), "; ",
+  "Single complaint = ", paste(sprintf("%.3f", anx_means_vec[["Single complaint"]]), collapse = ", "), "; ",
+  "Multiple complaints = ", paste(sprintf("%.3f", anx_means_vec[["Multiple complaints"]]), collapse = ", "), ". ",
+  "Within-group changes from T1 to T5: ",
+  "No complaint group, ", format_change_report(anx_t5_t1 %>% filter(SleepGroup == "No complaint")), "; ",
+  "Single complaint group, ", format_change_report(anx_t5_t1 %>% filter(SleepGroup == "Single complaint")), "; ",
+  "Multiple complaints group, ", format_change_report(anx_t5_t1 %>% filter(SleepGroup == "Multiple complaints")), ". ",
+  "At T5, participants with multiple complaints exhibited higher symptom burden than those with no complaints, difference = ",
+  format_change_report(anx_t5_contrast), ".\n"
+)
+
+writeLines(result_text_3_7, file.path(output_dir, "Symptom_burden_Results_3_7_text.txt"))
+cat("\n", result_text_3_7, "\n", sep = "")
+message("Symptom-burden LMM analysis completed successfully. Output saved to: ", output_dir)
