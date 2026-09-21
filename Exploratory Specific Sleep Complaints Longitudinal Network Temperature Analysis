@@ -1,0 +1,614 @@
+################################################################################
+## Exploratory Specific Sleep Complaints Longitudinal Network Temperature Analysis
+##
+## Purpose:
+##   Evaluate longitudinal network temperature trajectories and temperature divergence 
+##   (Delta-Delta-T) across five specific baseline sleep complaint phenotypes:
+##     1. No complaint (0 items positive)
+##     2. Difficulty falling asleep only (Q44 positive only)
+##     3. Early awakening only (Q64 positive only)
+##     4. Superficial sleep only (Q66 positive only)
+##     5. Multiple complaints (>=2 items positive)
+##
+## Features:
+##   - Item binarization (score >= 1 as positive).
+##   - Group-specific constrained Ising models (equal omega and tau across waves).
+##   - Stratified participant-level ID bootstrap for 95% CIs.
+##   - Benjamini-Hochberg (BH) False Discovery Rate (FDR) adjustment across the four 
+##     focal comparisons within each symptom domain at T5.
+##   - Automated generation of publication-ready summary text and tables for Results 3.8.
+################################################################################
+
+# ==============================================================================
+# 0. CONFIGURATION AND SETTINGS
+# ==============================================================================
+possible_dirs <- c(
+  "Full sample data",
+  file.path(getwd(), "Full sample data"),
+  "3155 sample data",
+  file.path(getwd(), "3155 sample data"),
+  ".",
+  "data"
+)
+data_dir <- possible_dirs[dir.exists(possible_dirs)][1]
+if (is.na(data_dir)) data_dir <- "Full sample data"
+
+if (all(file.exists(file.path(data_dir, c("wave1.xlsx", "wave2.xlsx", "wave3.xlsx", "wave4.xlsx", "wave5.xlsx"))))) {
+  wave_files <- c("wave1.xlsx", "wave2.xlsx", "wave3.xlsx", "wave4.xlsx", "wave5.xlsx")
+} else if (all(file.exists(file.path(data_dir, paste0("fixed_cohort_3155_T", 1:5, ".xlsx"))))) {
+  wave_files <- paste0("fixed_cohort_3155_T", 1:5, ".xlsx")
+} else {
+  wave_files <- c("wave1.xlsx", "wave2.xlsx", "wave3.xlsx", "wave4.xlsx", "wave5.xlsx")
+}
+
+# Precomputed sparse topology directory
+possible_pattern_dirs <- c(
+  "fixed_cohort_replication",
+  file.path(getwd(), "fixed_cohort_replication"),
+  file.path(data_dir, "fixed_cohort_replication")
+)
+pattern_dir <- possible_pattern_dirs[dir.exists(possible_pattern_dirs)][1]
+if (is.na(pattern_dir)) pattern_dir <- "fixed_cohort_replication"
+
+output_dir <- file.path(".", "exploratory_sleep_five_phenotypes")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Bootstrap settings
+BOOT_R <- 1000  # Number of bootstrap resamples (use 20 for quick test, 1000 for final)
+BOOT_CORES <- min(4L, max(1L, parallel::detectCores() - 1L))
+BOOT_BATCH_SIZE <- 50
+
+SEED_DEP <- 20260724
+SEED_ANX <- 20260725
+
+# ==============================================================================
+# 1. REQUIRED LIBRARIES
+# ==============================================================================
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(readr)
+  library(psychonetrics)
+  library(parallel)
+})
+
+# ==============================================================================
+# 2. ITEM DEFINITIONS AND FACTOR LEVELS
+# ==============================================================================
+dep_items <- paste0("Q", c(5, 14, 15, 20, 22, 26, 29, 30, 31, 32, 54, 71, 79))
+anx_items <- paste0("Q", c(2, 17, 23, 33, 39, 57, 72, 78, 80, 86))
+sleep_items <- c("Q44", "Q64", "Q66")
+
+wave_levels <- paste0("T", 1:5)
+five_group_levels <- c(
+  "No complaint",
+  "Difficulty falling asleep only",
+  "Early awakening only",
+  "Superficial sleep only",
+  "Multiple complaints"
+)
+
+# ==============================================================================
+# 3. HELPER FUNCTIONS
+# ==============================================================================
+to_numeric_safe <- function(x) {
+  suppressWarnings(readr::parse_number(as.character(x), na = c("", "NA", "N/A", "missing")))
+}
+
+edge_count <- function(adj_matrix) sum(adj_matrix[upper.tri(adj_matrix)] != 0)
+
+extract_pattern_from_model <- function(model, items, tol = 1e-8) {
+  omega_list <- psychonetrics::getmatrix(model, "omega")
+  if (is.list(omega_list)) omega_mat <- omega_list[[1]] else omega_mat <- omega_list
+  omega_mat <- as.matrix(omega_mat)
+  if (is.null(rownames(omega_mat))) rownames(omega_mat) <- items
+  if (is.null(colnames(omega_mat))) colnames(omega_mat) <- items
+  omega_mat <- omega_mat[items, items, drop = FALSE]
+  pattern <- 1L * (abs(omega_mat) > tol)
+  diag(pattern) <- 0L
+  pattern <- 1L * ((pattern + t(pattern)) > 0)
+  diag(pattern) <- 0L
+  dimnames(pattern) <- list(items, items)
+  pattern
+}
+
+fit_group_model <- function(group_data, items, pattern, domain_name, group_name) {
+  model_data <- group_data %>%
+    transmute(time = as.integer(time), across(all_of(items), as.integer)) %>%
+    drop_na(all_of(items)) %>%
+    arrange(time)
+  
+  invalid_flag <- vapply(model_data[items], function(x) any(!(x %in% c(-1L, 1L))), logical(1))
+  if (any(invalid_flag)) {
+    stop(domain_name, " / ", group_name, " has values outside {-1, 1}: ", paste(names(invalid_flag)[invalid_flag], collapse = ", "))
+  }
+  
+  cat("Fitting [", domain_name, " / ", group_name, "]; free edges = ", edge_count(pattern), "\n", sep = "")
+  psychonetrics::Ising(
+    data      = model_data,
+    vars      = items,
+    groups    = "time",
+    omega     = pattern,
+    equal     = c("omega", "tau"),
+    missing   = "listwise",
+    storedata = TRUE,
+    identify  = TRUE
+  ) %>% psychonetrics::runmodel()
+}
+
+extract_group_temperature <- function(group_models, domain_name) {
+  purrr::imap_dfr(group_models, function(model, group_name) {
+    beta_list <- psychonetrics::getmatrix(model, "beta")
+    beta_vector <- vapply(beta_list, function(x) mean(as.numeric(x), na.rm = TRUE), numeric(1))
+    tibble(
+      Domain      = domain_name,
+      SleepGroup  = group_name,
+      Wave        = paste0("T", seq_along(beta_vector)),
+      Beta        = beta_vector,
+      Temperature = 1 / beta_vector
+    )
+  })
+}
+
+run_stratified_bootstrap <- function(long_data, items, pattern, domain_name, output_dir,
+                                     R = 1000, ncores = 2, seed = 1, batch_size = 50) {
+  wide_by_group <- long_data %>%
+    select(ID, SleepGroup, time, all_of(items)) %>%
+    pivot_wider(
+      id_cols     = c(ID, SleepGroup),
+      names_from  = time,
+      values_from = all_of(items),
+      names_glue  = "{.value}.{time}"
+    ) %>%
+    split(.$SleepGroup)
+  
+  group_names_vec <- five_group_levels
+  group_n_vec <- vapply(wide_by_group[group_names_vec], nrow, integer(1))
+  cat("\n[", domain_name, "] Participant ID count per stratum:\n", sep = "")
+  print(group_n_vec)
+  
+  col_names <- as.vector(outer(paste0("T", 2:5), group_names_vec, function(w, g) paste(g, w, sep = "___")))
+  result_matrix <- matrix(NA_real_, nrow = R, ncol = length(col_names), dimnames = list(NULL, col_names))
+  
+  boot_items <- items
+  boot_pattern <- pattern
+  boot_groups <- group_names_vec
+  boot_wide_list <- wide_by_group
+  boot_seed <- seed
+  
+  worker_fun <- function(iter_index) {
+    set.seed(boot_seed + iter_index)
+    sampled_list <- lapply(boot_groups, function(g) {
+      curr_wide <- boot_wide_list[[g]]
+      n_subj <- nrow(curr_wide)
+      idx <- sample.int(n_subj, n_subj, replace = TRUE)
+      boot_wide <- curr_wide[idx, , drop = FALSE]
+      boot_wide$BootID <- paste(g, seq_len(n_subj), sep = "_")
+      boot_wide$ID <- NULL
+      boot_long <- tidyr::pivot_longer(
+        boot_wide,
+        cols          = -c(BootID, SleepGroup),
+        names_to      = c(".value", "time"),
+        names_pattern = "(Q\\d+)\\.(\\d+)"
+      )
+      boot_long$time <- as.integer(boot_long$time)
+      keep_row <- rowSums(!is.na(boot_long[, boot_items, drop = FALSE])) > 0
+      boot_long <- boot_long[keep_row, , drop = FALSE]
+      boot_long[, c("time", boot_items), drop = FALSE]
+    })
+    names(sampled_list) <- boot_groups
+    
+    out_vec <- rep(NA_real_, length(boot_groups) * 4)
+    names(out_vec) <- as.vector(outer(paste0("T", 2:5), boot_groups, function(w, g) paste(g, w, sep = "___")))
+    
+    for (g in boot_groups) {
+      model_data <- sampled_list[[g]]
+      model_g <- tryCatch({
+        psychonetrics::Ising(
+          data      = model_data,
+          vars      = boot_items,
+          groups    = "time",
+          omega     = boot_pattern,
+          equal     = c("omega", "tau"),
+          missing   = "listwise",
+          storedata = TRUE,
+          identify  = TRUE
+        ) %>% psychonetrics::runmodel()
+      }, error = function(e) NULL)
+      
+      if (!is.null(model_g)) {
+        b_list <- psychonetrics::getmatrix(model_g, "beta")
+        b_vec <- vapply(b_list, function(x) mean(as.numeric(x), na.rm = TRUE), numeric(1))
+        t_vec <- (1 / b_vec)[-1]
+        out_vec[paste(g, paste0("T", 2:5), sep = "___")] <- t_vec
+      }
+    }
+    out_vec
+  }
+  
+  cl <- parallel::makeCluster(ncores)
+  on.exit(parallel::stopCluster(cl), add = TRUE)
+  parallel::clusterEvalQ(cl, { library(psychonetrics); library(tidyr) })
+  parallel::clusterExport(cl, c("boot_items", "boot_pattern", "boot_groups", "boot_wide_list", "boot_seed"), envir = environment())
+  
+  num_batches <- ceiling(R / batch_size)
+  for (b in seq_len(num_batches)) {
+    batch_indices <- ((b - 1) * batch_size + 1):min(b * batch_size, R)
+    batch_results <- parallel::parLapply(cl, batch_indices, worker_fun)
+    result_matrix[batch_indices, ] <- do.call(rbind, batch_results)
+    saveRDS(list(t = result_matrix[1:max(batch_indices), , drop = FALSE], R = max(batch_indices)),
+            file.path(output_dir, paste0("Exploratory_sleep_", domain_name, "_bootstrap_partial.rds")))
+  }
+  
+  final_output <- list(t = result_matrix, R = R)
+  saveRDS(final_output, file.path(output_dir, paste0("Exploratory_sleep_", domain_name, "_bootstrap_final.rds")))
+  succ <- sum(complete.cases(result_matrix))
+  cat(domain_name, ": ", succ, "/", R, " complete bootstrap iterations.\n", sep = "")
+  final_output
+}
+
+summarize_group_bootstrap_ci <- function(point_estimates, bootstrap_result) {
+  boot_matrix <- as.matrix(bootstrap_result$t)
+  point_estimates %>%
+    mutate(
+      key = paste(SleepGroup, Wave, sep = "___"),
+      Bootstrap_CI_lower = NA_real_,
+      Bootstrap_CI_upper = NA_real_,
+      Successful_bootstrap = NA_integer_
+    ) %>%
+    group_by(SleepGroup, Wave) %>%
+    group_modify(~ {
+      curr_row <- .x
+      curr_key <- curr_row$key[1]
+      if (curr_row$Wave[1] == "T1") {
+        curr_row$Successful_bootstrap <- bootstrap_result$R
+        return(curr_row)
+      }
+      if (curr_key %in% colnames(boot_matrix)) {
+        vals <- boot_matrix[, curr_key]
+        vals <- vals[is.finite(vals)]
+        curr_row$Successful_bootstrap <- length(vals)
+        if (length(vals) >= 20) {
+          ci <- quantile(vals, c(0.025, 0.975), names = FALSE, type = 7)
+          curr_row$Bootstrap_CI_lower <- ci[1]
+          curr_row$Bootstrap_CI_upper <- ci[2]
+        }
+      }
+      curr_row
+    }) %>%
+    ungroup() %>%
+    select(-key)
+}
+
+calculate_delta_delta_table <- function(point_estimates, bootstrap_result, domain_name, wave_focus = c("T2", "T3", "T4", "T5")) {
+  boot_mat <- as.matrix(bootstrap_result$t)
+  ref_group <- "No complaint"
+  focal_groups <- setdiff(five_group_levels, ref_group)
+  
+  point_lookup <- setNames(point_estimates$Temperature, paste(point_estimates$SleepGroup, point_estimates$Wave, sep = "___"))
+  
+  records <- list()
+  for (focal in focal_groups) {
+    comp_name <- paste(focal, "vs", ref_group)
+    for (w in wave_focus) {
+      ref_T1  <- 1.0; focal_T1 <- 1.0
+      ref_w   <- point_lookup[[paste(ref_group, w, sep = "___")]]
+      focal_w <- point_lookup[[paste(focal, w, sep = "___")]]
+      pe <- (focal_w - focal_T1) - (ref_w - ref_T1)
+      
+      col_ref   <- paste(ref_group, w, sep = "___")
+      col_focal <- paste(focal, w, sep = "___")
+      
+      boot_diff <- (boot_mat[, col_focal] - 1.0) - (boot_mat[, col_ref] - 1.0)
+      boot_valid <- boot_diff[is.finite(boot_diff)]
+      n_valid <- length(boot_valid)
+      
+      if (n_valid >= 20) {
+        ci <- quantile(boot_valid, c(0.025, 0.975), names = FALSE, type = 7)
+        ci_lower <- ci[1]; ci_upper <- ci[2]
+        p_val <- min(1, 2 * min((sum(boot_valid <= 0) + 1) / (n_valid + 1), (sum(boot_valid >= 0) + 1) / (n_valid + 1)))
+        ci_excludes_zero <- (ci_lower > 0) || (ci_upper < 0)
+        boot_se <- sd(boot_valid)
+      } else {
+        ci_lower <- NA_real_; ci_upper <- NA_real_; p_val <- NA_real_; ci_excludes_zero <- NA; boot_se <- NA_real_
+      }
+      
+      records[[length(records) + 1]] <- tibble(
+        Domain               = domain_name,
+        Comparison           = comp_name,
+        FocalGroup           = focal,
+        ReferenceGroup       = ref_group,
+        Wave                 = w,
+        DeltaDeltaT          = pe,
+        Bootstrap_SE         = boot_se,
+        CI_lower             = ci_lower,
+        CI_upper             = ci_upper,
+        Raw_bootstrap_p      = p_val,
+        Successful_bootstrap = n_valid,
+        CI_excludes_zero     = ci_excludes_zero
+      )
+    }
+  }
+  bind_rows(records)
+}
+
+diagnose_divergence <- function(all_delta_delta) {
+  wave_order <- paste0("T", 2:5)
+  all_delta_delta %>%
+    mutate(Wave = factor(Wave, levels = wave_order)) %>%
+    arrange(Domain, Comparison, Wave) %>%
+    group_by(Domain, Comparison) %>%
+    group_modify(~ {
+      dat <- .x %>% arrange(Wave)
+      significant <- dat$CI_excludes_zero
+      significant[is.na(significant)] <- FALSE
+      direction <- sign(dat$DeltaDeltaT)
+      
+      first_wave <- if (any(significant)) {
+        as.character(dat$Wave[which(significant)[1]])
+      } else {
+        NA_character_
+      }
+      
+      persistent_wave <- NA_character_
+      for (j in seq_along(wave_order)) {
+        later <- j:length(wave_order)
+        if (all(significant[later]) && length(unique(direction[later])) == 1) {
+          persistent_wave <- wave_order[j]
+          break
+        }
+      }
+      
+      tibble(
+        First_wave_CI_excludes_zero = first_wave,
+        Persistent_from_wave        = persistent_wave,
+        T5_DeltaDeltaT              = dat$DeltaDeltaT[as.character(dat$Wave) == "T5"],
+        T5_direction                = ifelse(dat$DeltaDeltaT[as.character(dat$Wave) == "T5"] < 0, "Lower relative temperature", "Higher relative temperature")
+      )
+    }) %>%
+    ungroup()
+}
+
+format_ci_text <- function(ci_lower, ci_upper) {
+  if (is.na(ci_lower) || is.na(ci_upper)) return("NA to NA")
+  paste0(sprintf("%.3f", ci_lower), " to ", sprintf("%.3f", ci_upper))
+}
+
+format_p_text <- function(p_val) {
+  if (is.na(p_val)) return("NA")
+  if (p_val < 0.001) return("<0.001")
+  paste0("=", sprintf("%.3f", p_val))
+}
+
+# ==============================================================================
+# 4. LOAD AND PREPARE DATA
+# ==============================================================================
+file_paths <- file.path(data_dir, wave_files)
+if (!all(file.exists(file_paths))) {
+  stop("Missing wave data files:\n", paste(file_paths[!file.exists(file_paths)], collapse = "\n"))
+}
+
+wave_list <- lapply(file_paths, readxl::read_excel)
+names(wave_list) <- wave_levels
+
+required_items <- unique(c(dep_items, anx_items, sleep_items))
+for (wave_index in seq_along(wave_list)) {
+  current_data <- wave_list[[wave_index]]
+  if (!"ID" %in% names(current_data)) stop("T", wave_index, " missing ID.")
+  missing_items <- setdiff(required_items, names(current_data))
+  if (length(missing_items) > 0) stop("T", wave_index, " missing items: ", paste(missing_items, collapse = ", "))
+  current_data$ID <- trimws(as.character(current_data$ID))
+  for (item_name in required_items) current_data[[item_name]] <- to_numeric_safe(current_data[[item_name]])
+  wave_list[[wave_index]] <- current_data
+}
+
+# ==============================================================================
+# 5. BASELINE SPECIFIC SLEEP COMPLAINT STRATIFICATION (T1)
+# ==============================================================================
+t1_data <- wave_list$T1
+t1_sleep_matrix <- as.matrix(t1_data[, sleep_items, drop = FALSE])
+t1_missing_sleep <- rowSums(is.na(t1_sleep_matrix)) > 0
+cat("Participants excluded due to missing T1 sleep items: N =", sum(t1_missing_sleep), "\n")
+
+t1_valid_sleep <- t1_data[!t1_missing_sleep, , drop = FALSE]
+
+s44 <- as.integer(t1_valid_sleep[[sleep_items[1]]] >= 1)
+s64 <- as.integer(t1_valid_sleep[[sleep_items[2]]] >= 1)
+s66 <- as.integer(t1_valid_sleep[[sleep_items[3]]] >= 1)
+sleep_count <- s44 + s64 + s66
+
+t1_group_vector <- case_when(
+  sleep_count == 0             ~ "No complaint",
+  sleep_count == 1 & s44 == 1L ~ "Difficulty falling asleep only",
+  sleep_count == 1 & s64 == 1L ~ "Early awakening only",
+  sleep_count == 1 & s66 == 1L ~ "Superficial sleep only",
+  sleep_count >= 2             ~ "Multiple complaints",
+  TRUE                         ~ NA_character_
+)
+
+t1_group_assignment <- tibble(
+  ID = t1_valid_sleep$ID,
+  SleepGroup = factor(t1_group_vector, levels = five_group_levels)
+)
+
+group_sizes <- t1_group_assignment %>% count(SleepGroup, name = "Baseline_N")
+write.csv(group_sizes, file.path(output_dir, "Exploratory_sleep_baseline_group_sizes.csv"), row.names = FALSE)
+cat("\nT1 Five Sleep Phenotype Sample Sizes:\n")
+print(group_sizes)
+
+# ==============================================================================
+# 6. ASSEMBLE LONGITUDINAL DATASET
+# ==============================================================================
+long_records <- list()
+for (wave_index in seq_along(wave_list)) {
+  curr <- wave_list[[wave_index]] %>%
+    inner_join(t1_group_assignment, by = "ID") %>%
+    mutate(
+      time = wave_index,
+      across(all_of(c(dep_items, anx_items)), ~ ifelse(.x >= 1, 1L, -1L))
+    )
+  long_records[[wave_index]] <- curr
+}
+all_waves_long <- bind_rows(long_records)
+
+# ==============================================================================
+# 7. LOAD EMPIRICAL SPARSE TOPOLOGIES
+# ==============================================================================
+dep_pattern_path <- file.path(pattern_dir, "DEP_selected_omega_pattern.rds")
+anx_pattern_path <- file.path(pattern_dir, "ANX_selected_omega_pattern.rds")
+
+if (!file.exists(dep_pattern_path) || !file.exists(anx_pattern_path)) {
+  stop("Precomputed network topology pattern RDS files not found in: ", pattern_dir)
+}
+
+dep_pattern <- readRDS(dep_pattern_path)
+anx_pattern <- readRDS(anx_pattern_path)
+
+cat("Depression topology free edges: ", edge_count(dep_pattern), "\n")
+cat("Anxiety topology free edges:    ", edge_count(anx_pattern), "\n")
+
+# ==============================================================================
+# 8. FIT STRATIFIED ISING MODELS & ESTIMATE TEMPERATURES
+# ==============================================================================
+dep_group_models <- list()
+anx_group_models <- list()
+
+for (g in five_group_levels) {
+  grp_data <- all_waves_long %>% filter(SleepGroup == g)
+  dep_group_models[[g]] <- fit_group_model(grp_data, dep_items, dep_pattern, "Depression", g)
+  anx_group_models[[g]] <- fit_group_model(grp_data, anx_items, anx_pattern, "Anxiety", g)
+}
+
+saveRDS(dep_group_models, file.path(output_dir, "Exploratory_sleep_DEP_group_models.rds"))
+saveRDS(anx_group_models, file.path(output_dir, "Exploratory_sleep_ANX_group_models.rds"))
+
+dep_point <- extract_group_temperature(dep_group_models, "Depression")
+anx_point <- extract_group_temperature(anx_group_models, "Anxiety")
+all_point <- bind_rows(dep_point, anx_point)
+write.csv(all_point, file.path(output_dir, "Exploratory_sleep_temperature_point_estimates.csv"), row.names = FALSE)
+
+cat("\nFive-Phenotype Temperature Estimates:\n")
+print(all_point)
+
+# ==============================================================================
+# 9. STRATIFIED ID BOOTSTRAP INFERENCE
+# ==============================================================================
+dep_boot <- run_stratified_bootstrap(all_waves_long, dep_items, dep_pattern, "Depression", output_dir,
+                                    R = BOOT_R, ncores = BOOT_CORES, seed = SEED_DEP, batch_size = BOOT_BATCH_SIZE)
+anx_boot <- run_stratified_bootstrap(all_waves_long, anx_items, anx_pattern, "Anxiety", output_dir,
+                                    R = BOOT_R, ncores = BOOT_CORES, seed = SEED_ANX, batch_size = BOOT_BATCH_SIZE)
+
+dep_ci <- summarize_group_bootstrap_ci(dep_point, dep_boot)
+anx_ci <- summarize_group_bootstrap_ci(anx_point, anx_boot)
+all_ci <- bind_rows(dep_ci, anx_ci)
+write.csv(all_ci, file.path(output_dir, "Exploratory_sleep_group_temperature_bootstrap_CI.csv"), row.names = FALSE)
+
+# ==============================================================================
+# 10. PRIMARY T5 CONTRASTS (BH-FDR ADJUSTMENT) & WAVE-SPECIFIC DELTA-DELTA-T
+# ==============================================================================
+dep_dd_all <- calculate_delta_delta_table(dep_point, dep_boot, "Depression", wave_focus = paste0("T", 2:5))
+anx_dd_all <- calculate_delta_delta_table(anx_point, anx_boot, "Anxiety", wave_focus = paste0("T", 2:5))
+all_dd <- bind_rows(dep_dd_all, anx_dd_all)
+write.csv(all_dd, file.path(output_dir, "Exploratory_sleep_all_wave_DeltaDeltaT_raw.csv"), row.names = FALSE)
+
+# Focus on T5 with Benjamini-Hochberg FDR correction (4 tests per symptom domain)
+exploratory_t5 <- all_dd %>%
+  filter(Wave == "T5") %>%
+  group_by(Domain) %>%
+  mutate(
+    FDR_p           = p.adjust(Raw_bootstrap_p, method = "BH"),
+    Significant_FDR = !is.na(FDR_p) & (FDR_p < 0.05)
+  ) %>%
+  ungroup()
+write.csv(exploratory_t5, file.path(output_dir, "Exploratory_sleep_T1_T5_DeltaDeltaT_FDR.csv"), row.names = FALSE)
+
+# Intermediate waves (T2-T4)
+supp_t2_t4 <- all_dd %>% filter(Wave %in% c("T2", "T3", "T4"))
+write.csv(supp_t2_t4, file.path(output_dir, "Exploratory_sleep_T2_T4_DeltaDeltaT.csv"), row.names = FALSE)
+
+# Divergence trajectory summary
+divergence_summary <- diagnose_divergence(all_dd)
+write.csv(divergence_summary, file.path(output_dir, "Exploratory_sleep_divergence_summary.csv"), row.names = FALSE)
+
+# Publication inference table at T5
+no_comp_t5 <- all_point %>%
+  filter(SleepGroup == "No complaint", Wave == "T5") %>%
+  select(Domain, No_complaint_T5 = Temperature)
+
+t5_inference_table <- exploratory_t5 %>%
+  left_join(no_comp_t5, by = "Domain") %>%
+  left_join(
+    all_point %>% filter(Wave == "T5") %>% select(Domain, FocalGroup = SleepGroup, T5_Temperature = Temperature),
+    by = c("Domain", "FocalGroup")
+  ) %>%
+  transmute(
+    Domain,
+    Comparison,
+    SleepGroup           = FocalGroup,
+    No_complaint_T5,
+    T5_Temperature,
+    DeltaDeltaT,
+    Bootstrap_SE,
+    CI_lower,
+    CI_upper,
+    Raw_bootstrap_p,
+    FDR_p,
+    Significant_FDR,
+    Successful_bootstrap,
+    Direction = ifelse(DeltaDeltaT < 0, "Lower relative temperature", "Higher relative temperature")
+  )
+write.csv(t5_inference_table, file.path(output_dir, "Exploratory_sleep_T5_inference_table.csv"), row.names = FALSE)
+
+# ==============================================================================
+# 11. AUTOMATED REPORT GENERATION (RESULTS 3.8)
+# ==============================================================================
+extract_t5_row <- function(df, domain, comparison) {
+  df %>% filter(Domain == domain, Comparison == comparison) %>% slice(1)
+}
+
+dep_d_row <- extract_t5_row(exploratory_t5, "Depression", "Difficulty falling asleep only vs No complaint")
+dep_e_row <- extract_t5_row(exploratory_t5, "Depression", "Early awakening only vs No complaint")
+dep_s_row <- extract_t5_row(exploratory_t5, "Depression", "Superficial sleep only vs No complaint")
+dep_m_row <- extract_t5_row(exploratory_t5, "Depression", "Multiple complaints vs No complaint")
+
+anx_d_row <- extract_t5_row(exploratory_t5, "Anxiety", "Difficulty falling asleep only vs No complaint")
+anx_e_row <- extract_t5_row(exploratory_t5, "Anxiety", "Early awakening only vs No complaint")
+anx_s_row <- extract_t5_row(exploratory_t5, "Anxiety", "Superficial sleep only vs No complaint")
+anx_m_row <- extract_t5_row(exploratory_t5, "Anxiety", "Multiple complaints vs No complaint")
+
+get_t5_temp <- function(df, domain, group) {
+  df %>% filter(Domain == domain, SleepGroup == group, Wave == "T5") %>% pull(Temperature)
+}
+
+result_text_3_8 <- paste0(
+  "Results 3.8 Exploratory analyses of specific sleep complaints:\n\n",
+  "Depression network T5 relative temperatures: ",
+  "No complaint = ", sprintf("%.3f", get_t5_temp(all_point, "Depression", "No complaint")), ", ",
+  "Difficulty falling asleep only = ", sprintf("%.3f", get_t5_temp(all_point, "Depression", "Difficulty falling asleep only")), ", ",
+  "Early awakening only = ", sprintf("%.3f", get_t5_temp(all_point, "Depression", "Early awakening only")), ", ",
+  "Superficial sleep only = ", sprintf("%.3f", get_t5_temp(all_point, "Depression", "Superficial sleep only")), ", ",
+  "Multiple complaints = ", sprintf("%.3f", get_t5_temp(all_point, "Depression", "Multiple complaints")), ". ",
+  "Comparisons with the No complaint reference group: ",
+  "Difficulty falling asleep only, DeltaDeltaT = ", sprintf("%.4f", dep_d_row$DeltaDeltaT), ", 95% CI [", format_ci_text(dep_d_row$CI_lower, dep_d_row$CI_upper), "], FDR p ", format_p_text(dep_d_row$FDR_p), "; ",
+  "Early awakening only, DeltaDeltaT = ", sprintf("%.4f", dep_e_row$DeltaDeltaT), ", 95% CI [", format_ci_text(dep_e_row$CI_lower, dep_e_row$CI_upper), "], FDR p ", format_p_text(dep_e_row$FDR_p), "; ",
+  "Superficial sleep only, DeltaDeltaT = ", sprintf("%.4f", dep_s_row$DeltaDeltaT), ", 95% CI [", format_ci_text(dep_s_row$CI_lower, dep_s_row$CI_upper), "], FDR p ", format_p_text(dep_s_row$FDR_p), "; ",
+  "Multiple complaints, DeltaDeltaT = ", sprintf("%.4f", dep_m_row$DeltaDeltaT), ", 95% CI [", format_ci_text(dep_m_row$CI_lower, dep_m_row$CI_upper), "], FDR p ", format_p_text(dep_m_row$FDR_p), ".\n\n",
+  "Anxiety network T5 relative temperatures: ",
+  "No complaint = ", sprintf("%.3f", get_t5_temp(all_point, "Anxiety", "No complaint")), ", ",
+  "Difficulty falling asleep only = ", sprintf("%.3f", get_t5_temp(all_point, "Anxiety", "Difficulty falling asleep only")), ", ",
+  "Early awakening only = ", sprintf("%.3f", get_t5_temp(all_point, "Anxiety", "Early awakening only")), ", ",
+  "Superficial sleep only = ", sprintf("%.3f", get_t5_temp(all_point, "Anxiety", "Superficial sleep only")), ", ",
+  "Multiple complaints = ", sprintf("%.3f", get_t5_temp(all_point, "Anxiety", "Multiple complaints")), ". ",
+  "Comparisons with the No complaint reference group: ",
+  "Difficulty falling asleep only, DeltaDeltaT = ", sprintf("%.4f", anx_d_row$DeltaDeltaT), ", 95% CI [", format_ci_text(anx_d_row$CI_lower, anx_d_row$CI_upper), "], FDR p ", format_p_text(anx_d_row$FDR_p), "; ",
+  "Early awakening only, DeltaDeltaT = ", sprintf("%.4f", anx_e_row$DeltaDeltaT), ", 95% CI [", format_ci_text(anx_e_row$CI_lower, anx_e_row$CI_upper), "], FDR p ", format_p_text(anx_e_row$FDR_p), "; ",
+  "Superficial sleep only, DeltaDeltaT = ", sprintf("%.4f", anx_s_row$DeltaDeltaT), ", 95% CI [", format_ci_text(anx_s_row$CI_lower, anx_s_row$CI_upper), "], FDR p ", format_p_text(anx_s_row$FDR_p), "; ",
+  "Multiple complaints, DeltaDeltaT = ", sprintf("%.4f", anx_m_row$DeltaDeltaT), ", 95% CI [", format_ci_text(anx_m_row$CI_lower, anx_m_row$CI_upper), "], FDR p ", format_p_text(anx_m_row$FDR_p), ".\n"
+)
+
+writeLines(result_text_3_8, file.path(output_dir, "Exploratory_sleep_Results_3_8_text.txt"))
+cat("\n", result_text_3_8, "\n", sep = "")
+message("Exploratory sleep complaint analysis completed successfully. Output saved to: ", output_dir)
