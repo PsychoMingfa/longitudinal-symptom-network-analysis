@@ -1,0 +1,614 @@
+################################################################################
+## Longitudinal Network Temperature and Connectivity Analysis: Depression
+## 
+## Purpose:
+##   Derive network temperature (T = 1/beta), network entropy, global strength (NCT),
+##   and baseline sleep stratification trajectories for depression symptoms across 
+##   five longitudinal waves using multi-group Ising models.
+##
+## Reference:
+##   Based on the Ising network temperature framework (van Borkulo et al.; 
+##   psychonetrics package by Sacha Epskamp).
+################################################################################
+
+# ==============================================================================
+# 0. REQUIRED LIBRARIES
+# ==============================================================================
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(boot)
+  library(psychonetrics)
+  library(ggplot2)
+  library(readxl)
+  library(rlang)
+  library(purrr)
+  library(bootnet)
+  library(qgraph)
+  library(viridis)
+  library(IsingSampler)
+  library(NetworkComparisonTest)
+  library(parallel)
+  library(patchwork)
+  library(cowplot)
+})
+
+# ==============================================================================
+# 1. SETTINGS AND DATA LOADING
+# ==============================================================================
+# Search paths adaptively for input files
+possible_dirs <- c(
+  "Full sample data",
+  file.path(getwd(), "Full sample data"),
+  ".",
+  "data"
+)
+data_dir <- possible_dirs[dir.exists(possible_dirs) & file.exists(file.path(possible_dirs, "wave1.xlsx"))][1]
+if (is.na(data_dir)) data_dir <- "Full sample data"
+
+message("Loading wave 1-5 raw datasets from: ", data_dir)
+wave1 <- read_excel(file.path(data_dir, "wave1.xlsx"))
+wave2 <- read_excel(file.path(data_dir, "wave2.xlsx"))
+wave3 <- read_excel(file.path(data_dir, "wave3.xlsx"))
+wave4 <- read_excel(file.path(data_dir, "wave4.xlsx"))
+wave5 <- read_excel(file.path(data_dir, "wave5.xlsx"))
+
+# Depression items: SCL-90 items
+dep_items <- paste0("Q", c(5, 14, 15, 20, 22, 26, 29, 30, 31, 32, 54, 71, 79))
+
+# Item descriptions
+dep_labels <- c(
+  Q5  = "Hyposexuality", 
+  Q14 = "Lethargy", 
+  Q15 = "Suicidality", 
+  Q20 = "Tearfulness",
+  Q22 = "Paranoia", 
+  Q26 = "Guilt", 
+  Q29 = "Loneliness", 
+  Q30 = "Dysphoria",
+  Q31 = "Worry", 
+  Q32 = "Anhedonia", 
+  Q54 = "Hopelessness", 
+  Q71 = "Avolition",
+  Q79 = "Worthlessness"
+)
+
+# Harmonize column names and assign wave index
+prep_one_wave <- function(df, wave_index) {
+  df %>%
+    rename(duration = time) %>%
+    mutate(
+      time = wave_index,
+      time_label = paste0("T", wave_index)
+    )
+}
+
+w1 <- prep_one_wave(wave1, 1)
+w2 <- prep_one_wave(wave2, 2)
+w3 <- prep_one_wave(wave3, 3)
+w4 <- prep_one_wave(wave4, 4)
+w5 <- prep_one_wave(wave5, 5)
+
+# Combine into long-format dataframe
+long_raw <- bind_rows(w1, w2, w3, w4, w5)
+long_dep <- long_raw %>%
+  select(ID, time, all_of(dep_items))
+
+# Binarize items into {-1, 1}: 0 -> -1; >=1 -> 1
+long_dep_bin <- long_dep %>%
+  mutate(across(all_of(dep_items), ~ ifelse(. >= 1, 1L, -1L)))
+
+# ==============================================================================
+# 2. PARTICIPANT-LEVEL ID-BOOTSTRAP PREPARATION
+# ==============================================================================
+cohorts <- list(my = long_dep_bin)
+wide_cohort_dfs <- list()
+labels_list <- list(my = dep_items)
+
+for (cohort_name in names(cohorts)) {
+  cohort <- cohorts[[cohort_name]]
+  labels <- labels_list[[cohort_name]]
+  if ("ID" %in% names(cohort)) cohort <- cohort %>% rename(id = ID)
+  cohort <- cohort %>%
+    mutate(time = as.integer(time)) %>%
+    select(id, time, all_of(labels))
+  
+  # Pivot to wide format: one row per participant
+  wide_df <- cohort %>%
+    pivot_wider(
+      id_cols    = id,
+      names_from = time,
+      values_from = all_of(labels),
+      names_glue = "{.value}.{time}"
+    )
+  wide_cohort_dfs[[cohort_name]] <- wide_df
+}
+
+# Bootstrap statistic function: Resample IDs -> reshape to long -> fit model -> extract T
+bootstrap_function <- function(data, indices, labels) {
+  bd <- data[indices, , drop = FALSE]
+  bd$id <- seq_len(nrow(bd))
+  bd_long <- bd %>%
+    pivot_longer(
+      cols = -id,
+      names_to = c(".value", "time"),
+      names_pattern = "(Q\\d+)\\.(\\d+)"
+    ) %>%
+    mutate(time = as.integer(time))
+  
+  model <- Ising(bd_long, vars = labels, groups = "time") %>%
+    groupequal("omega") %>%
+    groupequal("tau") %>%
+    runmodel()
+  
+  temp_est <- 1 / model@parameters$est[model@parameters$matrix == "beta"]
+  temp_est[-1] # Wave 1 beta fixed to 1; return waves 2-5
+}
+
+# ==============================================================================
+# 3. RUN PARALLEL ID-BOOTSTRAP
+# ==============================================================================
+# Configurable bootstrap iterations:
+# Use 1000 for formal publication inference; set lower (e.g., 20) for quick check.
+BOOT_R <- 1000
+
+message(paste0("Initializing parallel bootstrap (R = ", BOOT_R, ")..."))
+ncores <- max(1L, parallel::detectCores() - 1L)
+cl <- parallel::makeCluster(ncores, type = "PSOCK")
+
+parallel::clusterEvalQ(cl, {
+  library(dplyr); library(tidyr); library(psychonetrics); library(boot)
+})
+
+parallel::clusterExport(
+  cl,
+  varlist = c("bootstrap_function", "labels_list", "wide_cohort_dfs"),
+  envir   = environment()
+)
+
+RNGkind("L'Ecuyer-CMRG")
+set.seed(123)
+parallel::clusterSetRNGStream(cl, iseed = 123)
+
+bootstrap_results <- list()
+for (cohort_name in names(wide_cohort_dfs)) {
+  wide_df <- wide_cohort_dfs[[cohort_name]]
+  labels  <- labels_list[[cohort_name]]
+  parallel::clusterExport(cl, varlist = c("labels"), envir = environment())
+  
+  bootstrap_results[[cohort_name]] <- boot::boot(
+    data      = wide_df,
+    statistic = function(data, indices) bootstrap_function(data, indices, labels),
+    R         = BOOT_R,
+    parallel  = "snow",
+    ncpus     = ncores,
+    cl        = cl
+  )
+  saveRDS(bootstrap_results[[cohort_name]],
+          paste0("bootstrap_results_", cohort_name, ".rds"))
+}
+try(parallel::stopCluster(cl), silent = TRUE)
+
+# ==============================================================================
+# 4. MODEL HIERARCHY COMPARISON & TEMPERATURE ESTIMATION
+# ==============================================================================
+message("Fitting full-sample model hierarchy for depression...")
+df_all_dep <- long_dep_bin %>%
+  mutate(time = as.integer(time)) %>%
+  select(time, all_of(dep_items)) %>%
+  drop_na(all_of(dep_items))
+
+# Model 1: Fully free (dense & sparse)
+m1  <- Ising(df_all_dep, vars = dep_items, groups = "time") %>% runmodel()
+m1b <- m1 %>% prune(alpha = 0.05) %>% stepup(alpha = 0.05)
+
+# Model 2: Equal network structure (omega)
+m2  <- m1 %>% groupequal("omega") %>% runmodel()
+m2b <- m2 %>% prune(alpha = 0.05) %>% stepup(mi = "mi_equal", alpha = 0.05)
+
+# Model 3: Equal network structure (omega) + equal thresholds (tau)
+m3  <- m2 %>% groupequal("tau") %>% runmodel()
+m3b <- m3 %>% prune(alpha = 0.05) %>% stepup(mi = "mi_equal", alpha = 0.05)
+
+# Model 4: Equal network + equal thresholds + equal beta (constant temperature)
+m4  <- m3 %>% groupequal("beta") %>% runmodel()
+m4b <- m4 %>% prune(alpha = 0.05) %>% stepup(mi = "mi_equal", alpha = 0.05)
+
+# Comparison summary
+cmp_dep <- psychonetrics::compare(
+  `1.free (dense)`        = m1,
+  `2.free (sparse)`       = m1b,
+  `3.eqΩ (dense)`         = m2,
+  `4.eqΩ (sparse)`        = m2b,
+  `5.eqΩ+τ (dense)`       = m3,
+  `6.eqΩ+τ (sparse)`      = m3b,
+  `7.eqΩ+τ+β (dense)`     = m4,
+  `8.eqΩ+τ+β (sparse)`    = m4b
+) %>% arrange(BIC)
+
+message("Model comparison results (ordered by BIC):")
+print(cmp_dep)
+
+# Select best fitting model (m3b: eqΩ + τ sparse)
+best_model_dep <- m3b
+
+betas_dep <- sapply(getmatrix(best_model_dep, "beta"), mean)
+T_dep     <- 1 / betas_dep
+cat("Depression relative temperatures across waves (T = 1/beta):\n")
+print(setNames(sprintf("%.3f", T_dep), paste0("T", seq_along(T_dep))))
+
+# ==============================================================================
+# 5. NETWORK VISUALIZATION & CONFIDENCE INTERVALS
+# ==============================================================================
+all_network_dep <- getmatrix(best_model_dep, "omega")
+network_dep <- all_network_dep[[1]]
+
+# 1) Network plot using qgraph
+set.seed(1)
+g_dep <- qgraph(
+  network_dep, 
+  layout = "spring", 
+  labels = dep_labels, 
+  theme = "colorblind", 
+  label.prop = 0.8, 
+  node.width = 1.0, 
+  label.norm = "000000"
+)
+
+# 2) Centrality plot
+centralityPlot(
+  list(Wave1 = network_dep),
+  theme_bw = FALSE,
+  scale    = "z-scores",
+  include  = c("Strength", "Closeness", "Betweenness", "ExpectedInfluence"),
+  labels   = dep_labels,
+  orderBy  = "Strength"
+)
+
+# 3) Analytical 95% CI calculation
+se_beta <- best_model_dep@parameters$se[best_model_dep@parameters$matrix == "beta"]
+z <- qnorm(0.975)
+beta_up <- betas_dep + z * se_beta
+beta_lo <- betas_dep - z * se_beta
+
+waves <- paste0("T", seq_along(betas_dep))
+plot_dep <- data.frame(
+  Wave        = factor(waves, levels = waves),
+  Temperature = 1 / betas_dep,
+  UpperCI     = 1 / beta_lo,
+  LowerCI     = 1 / beta_up
+)
+
+# 4) Integrate bootstrap 95% CI
+boot_res <- bootstrap_results$my
+if (is.null(boot_res) && file.exists("bootstrap_results_my.rds")) {
+  boot_res <- readRDS("bootstrap_results_my.rds")
+}
+
+boot_mat <- boot_res$t
+keep <- apply(boot_mat, 2, sd, na.rm = TRUE) > 0
+boot_mat <- boot_mat[, keep, drop = FALSE]
+se_boot <- apply(boot_mat, 2, sd, na.rm = TRUE)
+
+n_waves <- length(T_dep)
+plot_both <- plot_dep %>%
+  mutate(
+    LowerBoot = {
+      v <- rep(NA_real_, n_waves)
+      v[2:n_waves] <- T_dep[2:n_waves] - z * se_boot[seq_len(n_waves - 1)]
+      v
+    },
+    UpperBoot = {
+      v <- rep(NA_real_, n_waves)
+      v[2:n_waves] <- T_dep[2:n_waves] + z * se_boot[seq_len(n_waves - 1)]
+      v
+    }
+  )
+
+# 5) Temperature trajectory plot
+p_dep <- ggplot(plot_both, aes(x = Wave, y = Temperature, group = 1)) +
+  geom_point(shape = 16) +
+  geom_line(linewidth = 1) +
+  geom_errorbar(aes(ymin = LowerCI, ymax = UpperCI, color = "Analytical 95% CI"),
+                width = 0.4, linewidth = 1, show.legend = TRUE) +
+  geom_errorbar(aes(ymin = LowerBoot, ymax = UpperBoot, color = "Bootstrap 95% CI"),
+                width = 0.2, linewidth = 1, show.legend = TRUE) +
+  scale_color_manual(values = c("Analytical 95% CI" = "blue", "Bootstrap 95% CI" = "red"),
+                     name = NULL) +
+  labs(x = "Wave", y = "Temperature (1/β)", title = "Depression Network Temperature") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p_dep)
+ggsave("dep_temperature_with_bootstrap.png", p_dep, width = 7, height = 4, dpi = 300)
+
+# Export temperature point estimates and CIs
+out_tab <- plot_both %>%
+  transmute(
+    Wave,
+    T_point = round(Temperature, 4),
+    Analytic_L = round(LowerCI, 4),
+    Analytic_U = round(UpperCI, 4),
+    Boot_L     = round(LowerBoot, 4),
+    Boot_U     = round(UpperBoot, 4)
+  )
+write.csv(out_tab, "dep_temperature_CIs.csv", row.names = FALSE)
+
+# ==============================================================================
+# 6. SHANNON NETWORK ENTROPY ACROSS WAVES
+# ==============================================================================
+message("Calculating Shannon network entropy across waves...")
+omegas <- getmatrix(best_model_dep, "omega")
+taus   <- getmatrix(best_model_dep, "tau")
+betas  <- getmatrix(best_model_dep, "beta")
+
+entropy_fun <- if ("IsingEntropy" %in% ls("package:IsingSampler")) {
+  IsingSampler::IsingEntropy
+} else if ("IsingEntrophy" %in% ls("package:IsingSampler")) {
+  IsingSampler::IsingEntrophy
+} else {
+  stop("IsingEntropy / IsingEntrophy function not found in IsingSampler package.")
+}
+
+entropy_values <- numeric(n_waves)
+for (t in seq_len(n_waves)) {
+  G  <- omegas[[t]]
+  th <- as.numeric(taus[[t]])
+  be <- as.numeric(mean(betas[[t]]))
+  if (!isSymmetric(G)) G <- (G + t(G)) / 2
+  entropy_values[t] <- entropy_fun(graph = G, thresholds = th, beta = be)
+}
+
+plot_entropy_data <- data.frame(
+  Wave    = factor(paste0("T", seq_len(n_waves)), levels = paste0("T", seq_len(n_waves))),
+  Entropy = entropy_values
+)
+
+p_entropy <- ggplot(plot_entropy_data, aes(x = Wave, y = Entropy, group = 1)) +
+  geom_point(color = "blue", size = 3) +
+  geom_line(color = "blue", linewidth = 1) +
+  theme_minimal() +
+  labs(title = "Network Entropy Across Waves (Depression)", x = "Wave", y = "Entropy (H)")
+print(p_entropy)
+
+# ==============================================================================
+# 7. GLOBAL CONNECTIVITY (NETWORK COMPARISON TEST)
+# ==============================================================================
+message("Conducting pairwise Network Comparison Tests (NCT) for global connectivity...")
+long_dep_nct <- long_dep_bin %>%
+  mutate(across(all_of(dep_items), ~ ifelse(. == -1L, 0L, 1L)))
+
+time_points <- sort(unique(long_dep_nct$time))
+time_data <- vector("list", length(time_points))
+names(time_data) <- paste0("T", time_points)
+
+for (i in seq_along(time_points)) {
+  t <- time_points[i]
+  time_data[[i]] <- long_dep_nct %>%
+    filter(time == t) %>%
+    select(all_of(dep_items)) %>%
+    drop_na(all_of(dep_items))
+}
+
+strength_estimates <- rep(NA_real_, length(time_points))
+NCT_IT <- 1000 # Configurable: set to 10 for quick testing, 1000 for formal inference
+
+for (i in 1:(length(time_data) - 1)) {
+  nct_res <- NCT(
+    data1 = time_data[[i]],
+    data2 = time_data[[i + 1]],
+    it = NCT_IT,
+    binary.data = TRUE
+  )
+  if (i == 1) {
+    strength_estimates[i]     <- nct_res$glstrinv.sep[1]
+    strength_estimates[i + 1] <- nct_res$glstrinv.sep[2]
+  } else {
+    strength_estimates[i + 1] <- nct_res$glstrinv.sep[2]
+  }
+}
+
+df_strength <- data.frame(
+  Wave = factor(paste0("T", time_points), levels = paste0("T", time_points)),
+  GlobalStrength = strength_estimates
+)
+
+p_strength <- ggplot(df_strength, aes(x = Wave, y = GlobalStrength, group = 1)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  labs(title = "Global Strength Over Waves (Depression)", x = "Wave", y = "Global Strength") +
+  theme_minimal()
+print(p_strength)
+
+# ==============================================================================
+# 8. SYMPTOM MEAN AND VARIANCE OVER WAVES
+# ==============================================================================
+calc_mean <- function(m) apply(m, 2, function(x) mean(x, na.rm = TRUE))
+calc_var  <- function(m) apply(m, 2, function(x) var(x,  na.rm = TRUE))
+
+mean_list <- list()
+var_list  <- list()
+overall_means <- numeric(length(time_points))
+mean_variances <- numeric(length(time_points))
+
+for (i in seq_along(time_points)) {
+  t <- time_points[i]
+  mat_t <- long_dep_bin %>%
+    filter(time == t) %>%
+    select(all_of(dep_items)) %>%
+    as.matrix()
+  
+  m_t <- calc_mean(mat_t)
+  v_t <- calc_var(mat_t)
+  mean_list[[i]] <- m_t
+  var_list[[i]]  <- v_t
+  overall_means[i]  <- mean(m_t, na.rm = TRUE)
+  mean_variances[i] <- mean(v_t, na.rm = TRUE)
+}
+
+df_mv <- data.frame(
+  Wave     = factor(paste0("T", time_points), levels = paste0("T", time_points)),
+  Mean     = overall_means,
+  Variance = mean_variances
+)
+
+p_mv <- ggplot(df_mv, aes(x = Wave, y = Mean, group = 1)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = Mean - Variance, ymax = Mean + Variance), width = 0.1) +
+  labs(title = "Mean Symptom Score ± Variance (Depression)",
+       x = "Wave", y = "Mean Item Score ([-1, 1])") +
+  theme_minimal()
+print(p_mv)
+
+# ==============================================================================
+# 9. SLEEP-STRATIFIED TEMPERATURE PROFILES & MULTI-PANEL PLOTS
+# ==============================================================================
+message("Estimating temperature trajectories across baseline sleep complaint groups...")
+sleep_items <- paste0("Q", c(44, 64, 66))
+
+sleep_baseline <- w1 %>%
+  transmute(
+    ID,
+    s44 = as.integer(.data[[sleep_items[1]]] >= 1),
+    s64 = as.integer(.data[[sleep_items[2]]] >= 1),
+    s66 = as.integer(.data[[sleep_items[3]]] >= 1),
+    sleep_count = s44 + s64 + s66
+  ) %>%
+  mutate(
+    SleepGroup = case_when(
+      sleep_count == 0            ~ "Normal sleep",
+      sleep_count == 1 & s44 == 1 ~ "Difficulty falling asleep",
+      sleep_count == 1 & s64 == 1 ~ "Early awakening",
+      sleep_count == 1 & s66 == 1 ~ "Superficial sleep",
+      sleep_count >= 2            ~ "Mixed sleep problems",
+      TRUE                        ~ NA_character_
+    )
+  )
+
+long_dep_sleep <- long_dep_bin %>%
+  left_join(sleep_baseline %>% select(ID, SleepGroup), by = "ID") %>%
+  filter(!is.na(SleepGroup))
+
+fit_temp_ci <- function(df_long, items) {
+  df_use <- df_long %>%
+    mutate(time = as.integer(time)) %>%
+    select(time, all_of(items)) %>%
+    drop_na(all_of(items))
+  
+  if (nrow(df_use) < 100 || length(unique(df_use$time)) < 2) return(NULL)
+  
+  mod <- try(
+    Ising(df_use, vars = items, groups = "time") %>%
+      groupequal("omega") %>%
+      groupequal("tau") %>%
+      runmodel(),
+    silent = TRUE
+  )
+  if (inherits(mod, "try-error")) return(NULL)
+  
+  beta <- sapply(getmatrix(mod, "beta"), mean)
+  se   <- mod@parameters$se[mod@parameters$matrix == "beta"]
+  z    <- qnorm(0.975)
+  ci1  <- 1 / (beta - z * se)
+  ci2  <- 1 / (beta + z * se)
+  
+  tibble(
+    Wave    = factor(paste0("T", seq_along(beta)), levels = paste0("T", seq_along(beta))),
+    T       = 1 / beta,
+    LowerCI = pmin(ci1, ci2, na.rm = TRUE),
+    UpperCI = pmax(ci1, ci2, na.rm = TRUE)
+  )
+}
+
+group_order <- c(
+  "Normal sleep",
+  "Difficulty falling asleep",
+  "Early awakening",
+  "Superficial sleep",
+  "Mixed sleep problems"
+)
+
+curves_ci <- map_dfr(group_order, function(g) {
+  out <- fit_temp_ci(
+    df_long = filter(long_dep_sleep, SleepGroup == g),
+    items   = dep_items
+  )
+  if (is.null(out)) return(NULL)
+  out %>% mutate(Group = g)
+}) %>% mutate(Group = factor(Group, levels = group_order))
+
+pal <- c(
+  "Normal sleep"              = "#B8AEEA",
+  "Difficulty falling asleep" = "#FBE79E",
+  "Early awakening"           = "#71BBED",
+  "Superficial sleep"         = "#F2B56E",
+  "Mixed sleep problems"      = "#84D8D7"
+)
+
+cmp_list <- list(
+  A = c("Normal sleep", "Difficulty falling asleep"),
+  B = c("Normal sleep", "Early awakening"),
+  C = c("Normal sleep", "Superficial sleep"),
+  D = c("Normal sleep", "Mixed sleep problems")
+)
+
+yr <- range(c(curves_ci$LowerCI, curves_ci$UpperCI), na.rm = TRUE)
+ypad <- 0.03 * diff(yr)
+
+make_panel <- function(groups, tag) {
+  dat <- curves_ci %>%
+    filter(Group %in% groups) %>%
+    mutate(Group = factor(Group, levels = group_order))
+  
+  ggplot(dat, aes(x = Wave, y = T, color = Group, group = Group)) +
+    geom_errorbar(aes(ymin = LowerCI, ymax = UpperCI), width = 0.08, linewidth = 0.50, alpha = 0.85) +
+    geom_line(linewidth = 1.00) +
+    geom_point(size = 2.20) +
+    scale_color_manual(values = pal, breaks = group_order, drop = FALSE) +
+    coord_cartesian(ylim = c(yr[1] - ypad, yr[2] + ypad)) +
+    labs(
+      title = paste0(tag, ". ", groups[1], " vs ", groups[2]),
+      x = "Wave",
+      y = "Temperature (1/β)"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0, size = 12),
+      axis.title = element_text(size = 11),
+      axis.text  = element_text(size = 10, color = "black"),
+      legend.position = "none"
+    )
+}
+
+pA <- make_panel(cmp_list$A, "A")
+pB <- make_panel(cmp_list$B, "B")
+pC <- make_panel(cmp_list$C, "C")
+pD <- make_panel(cmp_list$D, "D")
+
+panel_plot <- (pA | pB) / (pC | pD)
+
+legend_df <- data.frame(
+  Wave  = factor(rep("T1", length(group_order)), levels = paste0("T", 1:5)),
+  T     = rep(1, length(group_order)),
+  Group = factor(group_order, levels = group_order)
+)
+
+legend_plot <- ggplot(legend_df, aes(x = Wave, y = T, color = Group, group = Group)) +
+  geom_line(linewidth = 1.00) +
+  geom_point(size = 2.20) +
+  scale_color_manual(values = pal, breaks = group_order, drop = FALSE) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE)) +
+  theme_void() +
+  theme(
+    legend.position = "bottom",
+    legend.title    = element_blank(),
+    legend.text     = element_text(size = 10)
+  )
+
+shared_legend <- cowplot::get_legend(legend_plot)
+p_final <- cowplot::plot_grid(panel_plot, shared_legend, ncol = 1, rel_heights = c(1, 0.13))
+print(p_final)
+ggsave("dep_sleep_stratified_temperature_panels.png", p_final, width = 9, height = 7, dpi = 300)
+
+message("Depression network analysis completed successfully.")
